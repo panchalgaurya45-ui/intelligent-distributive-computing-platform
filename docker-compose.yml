@@ -1,0 +1,62 @@
+services:
+  master:
+    build:
+      context: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      HEARTBEAT_TIMEOUT_SECONDS: "15"
+      OFFLINE_CHECK_INTERVAL_SECONDS: "2"
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+    networks:
+      - idcp-network
+
+  node-01:
+    build:
+      context: ./node-agent
+    environment:
+      NODE_ID: node-01
+      MASTER_URL: http://master:5000
+      HEARTBEAT_INTERVAL_SECONDS: "5"
+      REQUEST_TIMEOUT_SECONDS: "3"
+      LOG_LEVEL: INFO
+    depends_on:
+      - master
+    restart: unless-stopped
+    networks:
+      - idcp-network
+
+  node-02:
+    build:
+      context: ./node-agent
+    environment:
+      NODE_ID: node-02
+      MASTER_URL: http://master:5000
+      HEARTBEAT_INTERVAL_SECONDS: "5"
+      REQUEST_TIMEOUT_SECONDS: "3"
+      LOG_LEVEL: INFO
+    depends_on:
+      - master
+    restart: unless-stopped
+    networks:
+      - idcp-network
+
+  node-03:
+    build:
+      context: ./node-agent
+    environment:
+      NODE_ID: node-03
+      MASTER_URL: http://master:5000
+      HEARTBEAT_INTERVAL_SECONDS: "5"
+      REQUEST_TIMEOUT_SECONDS: "3"
+      LOG_LEVEL: INFO
+    depends_on:
+      - master
+    restart: unless-stopped
+    networks:
+      - idcp-network
+
+networks:
+  idcp-network:
+    driver: bridge
