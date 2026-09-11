@@ -7,4 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent.py .
 
+EXPOSE 5001
+
 CMD ["python", "agent.py"]

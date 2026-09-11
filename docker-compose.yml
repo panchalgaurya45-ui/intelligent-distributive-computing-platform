@@ -7,6 +7,8 @@ services:
     environment:
       HEARTBEAT_TIMEOUT_SECONDS: "15"
       OFFLINE_CHECK_INTERVAL_SECONDS: "2"
+      WORKER_TASK_TIMEOUT_SECONDS: "30"
+      TASK_DISPATCH_WORKERS: "3"
       LOG_LEVEL: INFO
     restart: unless-stopped
     networks:
@@ -18,6 +20,8 @@ services:
     environment:
       NODE_ID: node-01
       MASTER_URL: http://master:5000
+      WORKER_URL: http://node-01:5001
+      WORKER_PORT: "5001"
       HEARTBEAT_INTERVAL_SECONDS: "5"
       REQUEST_TIMEOUT_SECONDS: "3"
       LOG_LEVEL: INFO
@@ -33,6 +37,8 @@ services:
     environment:
       NODE_ID: node-02
       MASTER_URL: http://master:5000
+      WORKER_URL: http://node-02:5001
+      WORKER_PORT: "5001"
       HEARTBEAT_INTERVAL_SECONDS: "5"
       REQUEST_TIMEOUT_SECONDS: "3"
       LOG_LEVEL: INFO
@@ -48,6 +54,8 @@ services:
     environment:
       NODE_ID: node-03
       MASTER_URL: http://master:5000
+      WORKER_URL: http://node-03:5001
+      WORKER_PORT: "5001"
       HEARTBEAT_INTERVAL_SECONDS: "5"
       REQUEST_TIMEOUT_SECONDS: "3"
       LOG_LEVEL: INFO
