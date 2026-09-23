@@ -1,8 +1,8 @@
-"""IDCP master service for Stage 1 monitoring and Stage 2 task execution.
+"""IDCP master service for Stages 1-3.
 
-Stage 1 node state and Stage 2 task state are deliberately stored in separate
-in-memory registries. A later stage can replace either registry or the simple
-round-robin scheduler without changing the HTTP API.
+Stage 1 node state and Stage 2/3 task state are deliberately stored in
+separate in-memory registries. A later stage can replace either registry or
+the simple round-robin scheduler without changing the HTTP API.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -29,6 +30,7 @@ logger = logging.getLogger("idcp.master")
 
 TASK_TYPE_SUM_RANGE = "sum_range"
 NODE_TASK_STATES = {"IDLE", "BUSY"}
+MAX_SUBTASKS = 3
 
 
 def utc_now() -> str:
@@ -188,10 +190,11 @@ class NodeRegistry:
 
 
 class RoundRobinScheduler:
-    """Stage 2 scheduler: choose the next ONLINE, IDLE worker in turn.
+    """Choose ONLINE, IDLE workers in round-robin order.
 
-    Future risk-aware scheduling can replace this class while retaining its
-    ``select_node`` interface.
+    Stage 2 calls ``select_node`` for a single workload. Stage 3 calls
+    ``select_nodes`` to atomically claim a set of workers for one parent task.
+    A future risk-aware scheduler can retain these interfaces.
     """
 
     def __init__(self, nodes: NodeRegistry) -> None:
@@ -200,29 +203,40 @@ class RoundRobinScheduler:
         self._lock = threading.Lock()
 
     def select_node(self) -> dict[str, Any] | None:
-        """Claim the next available node, skipping OFFLINE and BUSY nodes."""
+        """Claim one available worker, skipping OFFLINE and BUSY nodes."""
+        selected = self.select_nodes(1)
+        return selected[0] if selected else None
+
+    def select_nodes(self, maximum_nodes: int) -> list[dict[str, Any]]:
+        """Claim up to ``maximum_nodes`` distinct workers in round-robin order."""
+        if maximum_nodes <= 0:
+            return []
         with self._lock:
             node_ids = self.nodes.node_ids()
             if not node_ids:
-                return None
+                return []
 
             try:
                 start_index = (node_ids.index(self._last_selected_node_id) + 1) % len(node_ids)
             except ValueError:
                 start_index = 0
 
+            selected: list[dict[str, Any]] = []
             for offset in range(len(node_ids)):
                 node_id = node_ids[(start_index + offset) % len(node_ids)]
                 node = self.nodes.claim_node(node_id)
                 if node is not None:
                     self._last_selected_node_id = node_id
-                    logger.info("Round-robin selected node %s", node_id)
-                    return node
-            return None
+                    selected.append(node)
+                    if len(selected) == maximum_nodes:
+                        break
+            if selected:
+                logger.info("Round-robin selected nodes: %s", ", ".join(node["node_id"] for node in selected))
+            return selected
 
 
 class TaskRegistry:
-    """Thread-safe, in-memory task state for Stage 2."""
+    """Thread-safe, in-memory parent-task and subtask state for Stage 3."""
 
     def __init__(self) -> None:
         self._tasks: dict[str, dict[str, Any]] = {}
@@ -238,7 +252,12 @@ class TaskRegistry:
             "assigned_node": None,
             "status": "CREATED",
             "result": None,
+            "final_result": None,
             "error": None,
+            "total_subtasks": 0,
+            "completed_subtasks": 0,
+            "failed_subtasks": 0,
+            "subtasks": [],
             "created_at": utc_now(),
             "started_at": None,
             "completed_at": None,
@@ -246,36 +265,110 @@ class TaskRegistry:
         with self._lock:
             self._tasks[task_id] = task
         logger.info("Task created: %s (%s, %s..%s)", task_id, task_type, start, end)
-        return dict(task)
+        return deepcopy(task)
 
-    def assign(self, task_id: str, node_id: str) -> bool:
+    def create_subtasks(
+        self,
+        task_id: str,
+        assignments: list[tuple[dict[str, Any], int, int]],
+    ) -> list[dict[str, Any]] | None:
+        """Create contiguous-range subtasks and record their selected workers."""
+        if not assignments:
+            return None
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or task["status"] != "CREATED":
-                return False
-            task.update(status="ASSIGNED", assigned_node=node_id)
-        logger.info("Task %s assigned to %s", task_id, node_id)
-        return True
+                return None
 
-    def mark_running(self, task_id: str) -> bool:
+            created_subtasks: list[dict[str, Any]] = []
+            for index, (node, start, end) in enumerate(assignments, start=1):
+                subtask = {
+                    "subtask_id": f"{task_id}-S{index}",
+                    "parent_task_id": task_id,
+                    "task_type": task["task_type"],
+                    "start": start,
+                    "end": end,
+                    "assigned_node": node["node_id"],
+                    "status": "ASSIGNED",
+                    "result": None,
+                    "error": None,
+                    "created_at": utc_now(),
+                    "started_at": None,
+                    "completed_at": None,
+                }
+                created_subtasks.append(subtask)
+
+            task.update(
+                status="SPLIT",
+                assigned_node=created_subtasks[0]["assigned_node"] if len(created_subtasks) == 1 else None,
+                total_subtasks=len(created_subtasks),
+                subtasks=created_subtasks,
+            )
+        logger.info("Task %s split into %s subtask(s)", task_id, len(created_subtasks))
+        return deepcopy(created_subtasks)
+
+    def mark_subtask_running(self, task_id: str, subtask_id: str) -> bool:
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task["status"] != "ASSIGNED":
+            subtask = self._find_subtask(task, subtask_id)
+            if subtask is None or subtask["status"] != "ASSIGNED":
                 return False
-            task.update(status="RUNNING", started_at=utc_now())
-        logger.info("Task %s is RUNNING", task_id)
+            subtask.update(status="RUNNING", started_at=utc_now())
+            if task["status"] == "SPLIT":
+                task.update(status="RUNNING", started_at=utc_now())
+        logger.info("Subtask %s is RUNNING", subtask_id)
         return True
 
-    def complete(self, task_id: str, result: int) -> bool:
+    def complete_subtask(self, task_id: str, subtask_id: str, result: int) -> bool:
+        """Store a worker result and aggregate only after every subtask succeeds."""
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task["status"] != "RUNNING":
+            subtask = self._find_subtask(task, subtask_id)
+            if subtask is None or subtask["status"] != "RUNNING":
                 return False
-            task.update(status="COMPLETED", result=result, completed_at=utc_now())
-        logger.info("Task %s COMPLETED", task_id)
+            subtask.update(status="COMPLETED", result=result, completed_at=utc_now())
+            task["completed_subtasks"] = sum(
+                candidate["status"] == "COMPLETED" for candidate in task["subtasks"]
+            )
+            logger.info("Subtask %s COMPLETED", subtask_id)
+
+            if task["status"] == "FAILED":
+                return True
+            if task["completed_subtasks"] != task["total_subtasks"]:
+                return True
+
+            # The master aggregates worker-returned partial results; it never
+            # recalculates the original range itself.
+            task["status"] = "AGGREGATING"
+            final_result = sum(candidate["result"] for candidate in task["subtasks"])
+            task.update(
+                status="COMPLETED",
+                final_result=final_result,
+                # ``result`` remains for Stage 2 clients that read this field.
+                result=final_result,
+                completed_at=utc_now(),
+            )
+        logger.info("Task %s aggregated and COMPLETED", task_id)
         return True
 
-    def fail(self, task_id: str, error: str) -> bool:
+    def fail_subtask(self, task_id: str, subtask_id: str, error: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            subtask = self._find_subtask(task, subtask_id)
+            if subtask is None or subtask["status"] in {"COMPLETED", "FAILED"}:
+                return False
+            subtask.update(status="FAILED", error=error, completed_at=utc_now())
+            task.update(
+                status="FAILED",
+                error=f"Subtask {subtask_id} failed: {error}",
+                failed_subtasks=sum(candidate["status"] == "FAILED" for candidate in task["subtasks"]),
+                completed_at=utc_now(),
+            )
+        logger.warning("Subtask %s FAILED: %s", subtask_id, error)
+        return True
+
+    def fail_parent(self, task_id: str, error: str) -> bool:
+        """Fail a parent before subtasks exist, for example with no workers."""
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or task["status"] in {"COMPLETED", "FAILED"}:
@@ -287,11 +380,17 @@ class TaskRegistry:
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
             task = self._tasks.get(task_id)
-            return dict(task) if task is not None else None
+            return deepcopy(task) if task is not None else None
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(task) for task in self._tasks.values()]
+            return [deepcopy(task) for task in self._tasks.values()]
+
+    @staticmethod
+    def _find_subtask(task: dict[str, Any] | None, subtask_id: str) -> dict[str, Any] | None:
+        if task is None:
+            return None
+        return next((subtask for subtask in task["subtasks"] if subtask["subtask_id"] == subtask_id), None)
 
 
 class WorkerTaskError(Exception):
@@ -324,7 +423,8 @@ class WorkerTaskClient:
 
         try:
             result_payload = json.loads(response_body)
-            if result_payload.get("status") != "COMPLETED" or not isinstance(result_payload.get("result"), int):
+            result = result_payload.get("result")
+            if result_payload.get("status") != "COMPLETED" or isinstance(result, bool) or not isinstance(result, int):
                 raise ValueError("invalid worker response")
             return result_payload["result"]
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -385,6 +485,31 @@ def parse_sum_range_task(payload: dict[str, Any]) -> tuple[str, int, int]:
     return task_type, start, end
 
 
+def split_range(start: int, end: int, parts: int) -> list[tuple[int, int]]:
+    """Split an inclusive integer range into balanced, contiguous non-empty parts.
+
+    Extra values are assigned to the earlier ranges, so ``1..10`` split across
+    three workers becomes ``1..4``, ``5..7``, and ``8..10``.
+    """
+    if parts <= 0:
+        raise ValueError("parts must be greater than zero")
+    total_values = end - start + 1
+    if total_values <= 0:
+        raise ValueError("range must contain at least one value")
+    if parts > total_values:
+        raise ValueError("parts cannot exceed the number of values in the range")
+
+    base_size, remainder = divmod(total_values, parts)
+    ranges: list[tuple[int, int]] = []
+    current_start = start
+    for index in range(parts):
+        size = base_size + (1 if index < remainder else 0)
+        current_end = current_start + size - 1
+        ranges.append((current_start, current_end))
+        current_start = current_end + 1
+    return ranges
+
+
 def require_json_object() -> tuple[dict[str, Any] | None, tuple[Any, int] | None]:
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -412,7 +537,7 @@ def create_app(
     tasks = TaskRegistry()
     scheduler = RoundRobinScheduler(nodes)
     executor = task_executor or ThreadPoolExecutor(
-        max_workers=int(os.getenv("TASK_DISPATCH_WORKERS", "3")),
+        max_workers=int(os.getenv("TASK_DISPATCH_WORKERS", "4")),
         thread_name_prefix="task-dispatch",
     )
     client = worker_client or WorkerTaskClient(worker_timeout)
@@ -424,38 +549,63 @@ def create_app(
         HEARTBEAT_TIMEOUT_SECONDS=timeout,
     )
 
-    def dispatch_task(task_id: str) -> None:
-        """Run outside Flask's request handler so heartbeats stay responsive."""
-        node = scheduler.select_node()
-        if node is None:
-            tasks.fail(task_id, "No ONLINE, IDLE worker node is available")
-            return
-
+    def dispatch_subtask(parent_task_id: str, subtask: dict[str, Any], node: dict[str, Any]) -> None:
+        """Execute one real range on one claimed worker without blocking Flask."""
+        subtask_id = subtask["subtask_id"]
         node_id = node["node_id"]
         try:
-            if not tasks.assign(task_id, node_id):
-                return
-            if not tasks.mark_running(task_id):
-                return
-            task = tasks.get(task_id)
-            if task is None:
+            if not tasks.mark_subtask_running(parent_task_id, subtask_id):
                 return
             result = client.execute(
                 node["worker_url"],
                 {
-                    "task_id": task_id,
-                    "task_type": task["task_type"],
-                    "parameters": {"start": task["start"], "end": task["end"]},
+                    "task_id": subtask_id,
+                    "task_type": subtask["task_type"],
+                    "parameters": {"start": subtask["start"], "end": subtask["end"]},
                 },
             )
-            tasks.complete(task_id, result)
+            tasks.complete_subtask(parent_task_id, subtask_id, result)
         except WorkerTaskError as exc:
-            tasks.fail(task_id, str(exc))
+            tasks.fail_subtask(parent_task_id, subtask_id, str(exc))
         except Exception:
-            logger.exception("Unexpected dispatch failure for task %s", task_id)
-            tasks.fail(task_id, "Task execution failed")
+            logger.exception("Unexpected dispatch failure for subtask %s", subtask_id)
+            tasks.fail_subtask(parent_task_id, subtask_id, "Subtask execution failed")
         finally:
             nodes.set_task_state(node_id, "IDLE")
+
+    def dispatch_parent_task(task_id: str) -> None:
+        """Split a parent task and schedule every subtask on a real worker."""
+        task = tasks.get(task_id)
+        if task is None:
+            return
+
+        desired_subtasks = min(MAX_SUBTASKS, task["end"] - task["start"] + 1)
+        selected_nodes = scheduler.select_nodes(desired_subtasks)
+        if not selected_nodes:
+            tasks.fail_parent(task_id, "No ONLINE, IDLE worker node is available")
+            return
+
+        submitted_node_ids: set[str] = set()
+        try:
+            ranges = split_range(task["start"], task["end"], len(selected_nodes))
+            assignments = [
+                (node, range_start, range_end)
+                for node, (range_start, range_end) in zip(selected_nodes, ranges, strict=True)
+            ]
+            subtasks = tasks.create_subtasks(task_id, assignments)
+            if subtasks is None:
+                raise RuntimeError("Task could not be split")
+            for subtask, node in zip(subtasks, selected_nodes, strict=True):
+                executor.submit(dispatch_subtask, task_id, subtask, node)
+                submitted_node_ids.add(node["node_id"])
+        except Exception:
+            logger.exception("Unexpected split/dispatch failure for task %s", task_id)
+            tasks.fail_parent(task_id, "Task could not be split or dispatched")
+            for node in selected_nodes:
+                # Do not incorrectly free a node whose subtask was already
+                # submitted and may still be executing.
+                if node["node_id"] not in submitted_node_ids:
+                    nodes.set_task_state(node["node_id"], "IDLE")
 
     @app.post("/api/nodes/register")
     def register_node() -> tuple[Any, int]:
@@ -536,7 +686,7 @@ def create_app(
 
         task = tasks.create(task_type, start, end)
         # The initial response is always CREATED; lifecycle advances asynchronously.
-        executor.submit(dispatch_task, task["task_id"])
+        executor.submit(dispatch_parent_task, task["task_id"])
         return jsonify(task_id=task["task_id"], status="CREATED"), 201
 
     @app.get("/api/tasks")

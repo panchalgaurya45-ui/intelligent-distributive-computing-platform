@@ -1,10 +1,10 @@
 # Intelligent Distributive Computing Platform (IDCP)
 
-IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stage 1 distributed infrastructure and **Stage 2 real workload execution** on a single laptop.
+IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stage 1 distributed infrastructure, Stage 2 real workload execution, and **Stage 3 distributed task splitting and result aggregation** on a single laptop.
 
-It deliberately does not yet include ML, blockchain, a database, React, task splitting, workload migration, predictive/risk-aware scheduling, or advanced scheduling. The Flask master keeps state in memory, and the node agent is isolated so a later stage can replace or extend either concern cleanly.
+It deliberately does not yet include ML, blockchain, a database, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. The Flask master keeps state in memory, and the node agent is isolated so a later stage can replace or extend either concern cleanly.
 
-## What Stages 1 and 2 implement
+## What Stages 1-3 implement
 
 - A Python/Flask master service with JSON APIs for registration, heartbeats, node listing, and health.
 - A reusable Python node agent that collects real `psutil` CPU and memory metrics.
@@ -15,6 +15,8 @@ It deliberately does not yet include ML, blockchain, a database, React, task spl
 - In-memory task lifecycle tracking and asynchronous task dispatch, so task execution does not block heartbeats.
 - A simple `ONLINE` + `IDLE` round-robin scheduler.
 - One real computation type: `sum_range`.
+- Stage 3 splitting of one `sum_range` parent task into up to three real worker subtasks.
+- Master-side aggregation of only the results returned by those workers.
 
 `available_memory` is reported in bytes, exactly as provided by `psutil`.
 
@@ -34,6 +36,28 @@ Flask :5000        Node Agent + Task API :5001 (same code in each container)
 Each agent calls `http://master:5000` through Docker's service-name DNS; it does not use `localhost` or a fixed IP address. The master sends work to the selected agent using its service-name URL, such as `http://node-01:5001/api/tasks/execute`. Only the master is published to the Windows host at `http://localhost:5000`.
 
 The three worker containers are **logical worker nodes**, not three physical computers. They share the host laptop's underlying CPU and RAM, although each runs as an independent process/container and reports the metrics visible within its own container. Later, run the same `node-agent` image or Python program on separate machines/VMs and set `MASTER_URL` to the reachable master address; no change to the agent's collection or heartbeat logic is required.
+
+### Stage 3 execution flow
+
+```text
+POST /api/tasks: sum_range(1..1,000,000)
+                  |
+                  v
+        Master: split into contiguous subranges
+                  |
+     +------------+------------+
+     |            |            |
+ node-01       node-02       node-03
+ 1..333334   333335..666667  666668..1000000
+     |            |            |
+     +------------+------------+
+                  |
+                  v
+       Master aggregates returned partial results
+                  |
+                  v
+            final_result = 500000500000
+```
 
 ## Prerequisites
 
@@ -63,7 +87,7 @@ docker compose up --build -d
 docker compose down
 ```
 
-This stops and removes the containers and Docker network. Stages 1 and 2 have no database or volume to preserve.
+This stops and removes the containers and Docker network. Stages 1-3 have no database or volume to preserve.
 
 ## View logs
 
@@ -94,7 +118,7 @@ The available APIs are:
 | `GET` | `/api/tasks` | List all known workloads |
 | `GET` | `/api/tasks/<task_id>` | Retrieve one workload and its result |
 
-## Stage 2: real workload execution
+## Stage 2: single-worker workload execution
 
 Stage 2 adds one meaningful computation:
 
@@ -108,7 +132,7 @@ Stage 2 adds one meaningful computation:
 
 The selected node performs `sum(range(1, 1000001))` using Python integer arithmetic and returns `500000500000`; the result is not fabricated by the master.
 
-The task lifecycle is:
+With one available node, the task lifecycle is:
 
 ```text
 CREATED -> ASSIGNED -> RUNNING -> COMPLETED
@@ -116,7 +140,7 @@ CREATED -> ASSIGNED -> RUNNING -> COMPLETED
                          +-> FAILED
 ```
 
-The POST response always initially reports `CREATED`. A background dispatch thread then selects the next `ONLINE` and `IDLE` node in round-robin order, marks it `BUSY`, sends it the task, stores the real result, and returns that node to `IDLE`. `GET /api/nodes` includes this simple node `task_state` alongside the existing Stage 1 metrics.
+The POST response always initially reports `CREATED`. A background dispatch thread selects the next `ONLINE` and `IDLE` node in round-robin order, marks it `BUSY`, sends it the task, stores the real result, and returns that node to `IDLE`. `GET /api/nodes` includes this simple node `task_state` alongside the existing Stage 1 metrics.
 
 Submit and retrieve a workload from PowerShell:
 
@@ -128,9 +152,35 @@ Invoke-RestMethod "http://localhost:5000/api/tasks/$($created.task_id)" | Conver
 Invoke-RestMethod http://localhost:5000/api/tasks | ConvertTo-Json -Depth 5
 ```
 
-Submitting several completed tasks in sequence demonstrates round-robin assignment across `node-01`, `node-02`, and `node-03`. Invalid requests are rejected with JSON errors: missing/unsupported `task_type`, non-integer `start` or `end`, and `start > end` are all invalid.
+Invalid requests are rejected with JSON errors: missing/unsupported `task_type`, non-integer `start` or `end`, and `start > end` are all invalid.
 
-Stage 2 does **not** split a task between nodes, predict workload risk, migrate/checkpoint work, or retry it on a different node. Those are later-stage concerns.
+## Stage 3: task splitting and aggregation
+
+Stage 3 extends the same `POST /api/tasks` request. It claims up to three real `ONLINE` and `IDLE` workers and splits the inclusive range into balanced, contiguous, non-overlapping subranges. If fewer workers are available, it uses the available number; if none are available, the parent task fails cleanly. A range shorter than the worker count is split only into non-empty subtasks.
+
+For `1..1000000` on three workers, the deterministic splitter produces:
+
+| Worker | Subtask range |
+| --- | --- |
+| `node-01` | `1..333334` |
+| `node-02` | `333335..666667` |
+| `node-03` | `666668..1000000` |
+
+For an uneven range, extra values go to earlier chunks: `1..10` across three workers becomes `1..4`, `5..7`, and `8..10`. This guarantees no gap and no overlap.
+
+The worker remains unaware of the parent task. It calculates only its assigned `sum_range` subtask. The master records each returned partial result and aggregates those values; it never recalculates the original parent range as a shortcut.
+
+Distributed task lifecycle:
+
+```text
+CREATED -> SPLIT -> subtask ASSIGNED/RUNNING -> AGGREGATING -> COMPLETED
+                            |
+                            +---------------------------> FAILED
+```
+
+`GET /api/tasks/<task_id>` now includes `total_subtasks`, `completed_subtasks`, `failed_subtasks`, `subtasks`, and `final_result`. The existing Stage 2 `result` field is preserved as an alias for `final_result`, and a one-worker task produces exactly one subtask.
+
+Stage 3 demonstrates real distributed computation, but does **not** add task retries, migration, checkpointing, self-healing, ML, prediction, risk-aware scheduling, databases, or any Stage 4 feature.
 
 ## Test node failure and recovery
 
@@ -156,16 +206,16 @@ Stage 2 does **not** split a task between nodes, predict workload risk, migrate/
 
    Within one heartbeat interval (five seconds), the agent re-registers and reports as `ONLINE` again.
 
-To confirm Stage 2 avoids an offline worker, stop `node-01`, wait for its `OFFLINE` status, then submit a `sum_range` task. It will be assigned to an `ONLINE`, `IDLE` node such as `node-02` or `node-03`; Stage 2 does not migrate a task already assigned to a failed worker.
+To confirm Stage 3 avoids an offline worker, stop `node-01`, wait for its `OFFLINE` status, then submit a `sum_range` task. The parent will split only across `ONLINE`, `IDLE` remaining nodes. Stage 3 does not migrate or retry a subtask already assigned to a failed worker.
 
 ## Automated tests
 
-Lightweight `unittest` coverage is in `tests/test_stage2.py`. It checks the real `sum_range` computation, invalid task rejection, task creation/execution/result retrieval, round-robin assignment, and that an offline node is skipped.
+Lightweight `unittest` coverage is in `tests/test_stage2.py` and `tests/test_stage3.py`. It covers Stage 2 single-node compatibility as well as exact/non-even splitting, no gaps/overlaps, available-node subtask counts, worker subtask computation, aggregation, parent failure, and offline-node selection.
 
 With Python dependencies installed locally, run:
 
 ```powershell
-python -m unittest tests/test_stage2.py
+python -m unittest discover -s tests -v
 ```
 
 ## Configuration
@@ -174,7 +224,7 @@ The Compose defaults are intentionally conservative and can be changed in `docke
 
 - `HEARTBEAT_TIMEOUT_SECONDS=15` on the master.
 - `OFFLINE_CHECK_INTERVAL_SECONDS=2` on the master.
-- `WORKER_TASK_TIMEOUT_SECONDS=30` and `TASK_DISPATCH_WORKERS=3` on the master.
+- `WORKER_TASK_TIMEOUT_SECONDS=30` and `TASK_DISPATCH_WORKERS=4` on the master (one parent-dispatch thread plus up to three subtasks).
 - `HEARTBEAT_INTERVAL_SECONDS=5` and `REQUEST_TIMEOUT_SECONDS=3` on each agent.
 - `WORKER_URL` and `WORKER_PORT=5001` on each agent. Compose assigns Docker service-name URLs for all three workers.
 

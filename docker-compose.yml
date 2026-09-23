@@ -8,7 +8,8 @@ services:
       HEARTBEAT_TIMEOUT_SECONDS: "15"
       OFFLINE_CHECK_INTERVAL_SECONDS: "2"
       WORKER_TASK_TIMEOUT_SECONDS: "30"
-      TASK_DISPATCH_WORKERS: "3"
+      # One parent-dispatch thread plus up to three concurrent subtasks.
+      TASK_DISPATCH_WORKERS: "4"
       LOG_LEVEL: INFO
     restart: unless-stopped
     networks:
