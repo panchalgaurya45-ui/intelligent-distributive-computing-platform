@@ -6,6 +6,7 @@ the observable Stage 2 behavior: one range is executed and ``result`` is set.
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("IDCP_DATABASE_URI", "sqlite+pysqlite:///:memory:")
 sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 import app as master  # noqa: E402
 

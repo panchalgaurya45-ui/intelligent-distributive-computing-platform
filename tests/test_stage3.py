@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import time
 import types
@@ -12,6 +13,7 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("IDCP_DATABASE_URI", "sqlite+pysqlite:///:memory:")
 sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 import app as master  # noqa: E402
 

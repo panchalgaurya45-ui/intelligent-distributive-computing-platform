@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - idcp-network
+
   master:
     build:
       context: ./backend
@@ -10,7 +28,17 @@ services:
       WORKER_TASK_TIMEOUT_SECONDS: "30"
       # One parent-dispatch thread plus up to three concurrent subtasks.
       TASK_DISPATCH_WORKERS: "4"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+      DATABASE_RETRY_ATTEMPTS: "30"
+      DATABASE_RETRY_DELAY_SECONDS: "2"
       LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - idcp-network
@@ -69,3 +97,6 @@ services:
 networks:
   idcp-network:
     driver: bridge
+
+volumes:
+  postgres-data:

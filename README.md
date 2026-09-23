@@ -1,8 +1,8 @@
 # Intelligent Distributive Computing Platform (IDCP)
 
-IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stage 1 distributed infrastructure, Stage 2 real workload execution, and **Stage 3 distributed task splitting and result aggregation** on a single laptop.
+IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stages 1-3 plus **Stage 4A: PostgreSQL and SQLAlchemy foundation** on a single laptop.
 
-It deliberately does not yet include ML, blockchain, a database, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. The Flask master keeps state in memory, and the node agent is isolated so a later stage can replace or extend either concern cleanly.
+It deliberately does not yet include ML, blockchain, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. Stage 4A creates the initial persistent schema; the proven Stage 1-3 registries intentionally remain in memory until a later persistence migration stage.
 
 ## What Stages 1-3 implement
 
@@ -27,13 +27,14 @@ Windows laptop (Docker Desktop + WSL2)
             |
        Docker bridge network: idcp-network
             |
-  +---------+---------+---------+
-  |                   |         |
-master             node-01   node-02   node-03
-Flask :5000        Node Agent + Task API :5001 (same code in each container)
+  +---------+---------+---------+---------+
+  |         |         |         |         |
+master   postgres  node-01   node-02   node-03
+Flask    PostgreSQL Node Agent + Task API :5001
+ :5000     :5432    (same code in each container)
 ```
 
-Each agent calls `http://master:5000` through Docker's service-name DNS; it does not use `localhost` or a fixed IP address. The master sends work to the selected agent using its service-name URL, such as `http://node-01:5001/api/tasks/execute`. Only the master is published to the Windows host at `http://localhost:5000`.
+Each agent calls `http://master:5000` through Docker's service-name DNS; it does not use `localhost` or a fixed IP address. The master sends work to the selected agent using its service-name URL, such as `http://node-01:5001/api/tasks/execute`, and connects to PostgreSQL through `postgres:5432`. Only the master is published to the Windows host at `http://localhost:5000`.
 
 The three worker containers are **logical worker nodes**, not three physical computers. They share the host laptop's underlying CPU and RAM, although each runs as an independent process/container and reports the metrics visible within its own container. Later, run the same `node-agent` image or Python program on separate machines/VMs and set `MASTER_URL` to the reachable master address; no change to the agent's collection or heartbeat logic is required.
 
@@ -70,6 +71,9 @@ POST /api/tasks: sum_range(1..1,000,000)
 From the repository root in PowerShell:
 
 ```powershell
+Copy-Item .env.example .env
+# Edit .env and replace POSTGRES_PASSWORD before continuing.
+docker compose config
 docker compose up --build
 ```
 
@@ -87,7 +91,7 @@ docker compose up --build -d
 docker compose down
 ```
 
-This stops and removes the containers and Docker network. Stages 1-3 have no database or volume to preserve.
+This stops the containers and removes the network. PostgreSQL data remains in the named `postgres-data` volume. To remove it too, use `docker compose down -v`.
 
 ## View logs
 
@@ -180,7 +184,15 @@ CREATED -> SPLIT -> subtask ASSIGNED/RUNNING -> AGGREGATING -> COMPLETED
 
 `GET /api/tasks/<task_id>` now includes `total_subtasks`, `completed_subtasks`, `failed_subtasks`, `subtasks`, and `final_result`. The existing Stage 2 `result` field is preserved as an alias for `final_result`, and a one-worker task produces exactly one subtask.
 
-Stage 3 demonstrates real distributed computation, but does **not** add task retries, migration, checkpointing, self-healing, ML, prediction, risk-aware scheduling, databases, or any Stage 4 feature.
+Stage 3 demonstrates real distributed computation, but does **not** add task retries, migration, checkpointing, self-healing, ML, prediction, or risk-aware scheduling.
+
+## Stage 4A: PostgreSQL and SQLAlchemy foundation
+
+Stage 4A adds a PostgreSQL 16 service and a small Flask-SQLAlchemy model layer. The master receives `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` from Docker Compose and builds its database URL with the `postgres` service name, never `localhost`.
+
+At startup, the master retries the database connection while PostgreSQL initializes, then calls `db.create_all()` to create the initial `nodes` table. The [Node model](backend/models.py) contains persistent node identity, endpoint, registration, heartbeat, and audit timestamp fields.
+
+This is deliberately a foundation step: current registration, heartbeat, task, subtask, and scheduler state still use the validated Stage 1-3 in-memory registries. No task/node persistence migration or database migration tooling (Alembic) has been added yet.
 
 ## Test node failure and recovery
 
@@ -210,7 +222,7 @@ To confirm Stage 3 avoids an offline worker, stop `node-01`, wait for its `OFFLI
 
 ## Automated tests
 
-Lightweight `unittest` coverage is in `tests/test_stage2.py` and `tests/test_stage3.py`. It covers Stage 2 single-node compatibility as well as exact/non-even splitting, no gaps/overlaps, available-node subtask counts, worker subtask computation, aggregation, parent failure, and offline-node selection.
+Lightweight `unittest` coverage is in `tests/test_stage2.py`, `tests/test_stage3.py`, and `tests/test_database.py`. It covers Stage 2 single-node compatibility, Stage 3 splitting/aggregation, and the Stage 4A schema/configuration foundation.
 
 With Python dependencies installed locally, run:
 
@@ -225,6 +237,8 @@ The Compose defaults are intentionally conservative and can be changed in `docke
 - `HEARTBEAT_TIMEOUT_SECONDS=15` on the master.
 - `OFFLINE_CHECK_INTERVAL_SECONDS=2` on the master.
 - `WORKER_TASK_TIMEOUT_SECONDS=30` and `TASK_DISPATCH_WORKERS=4` on the master (one parent-dispatch thread plus up to three subtasks).
+- `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` in `.env`; see `.env.example`.
+- `DATABASE_RETRY_ATTEMPTS=30` and `DATABASE_RETRY_DELAY_SECONDS=2` on the master.
 - `HEARTBEAT_INTERVAL_SECONDS=5` and `REQUEST_TIMEOUT_SECONDS=3` on each agent.
 - `WORKER_URL` and `WORKER_PORT=5001` on each agent. Compose assigns Docker service-name URLs for all three workers.
 

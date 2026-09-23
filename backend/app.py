@@ -23,6 +23,8 @@ from typing import Any, Protocol
 
 from flask import Flask, jsonify, request
 
+from database import configure_database, initialize_database
+import models  # noqa: F401  # Register SQLAlchemy models before db.create_all().
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
@@ -524,6 +526,8 @@ def create_app(
     task_executor: TaskSubmitter | None = None,
     worker_client: WorkerTaskClient | None = None,
     start_monitor: bool = True,
+    database_uri: str | None = None,
+    initialize_db: bool = True,
 ) -> Flask:
     """Create the master app; optional dependencies make API tests self-contained."""
     timeout = heartbeat_timeout_seconds if heartbeat_timeout_seconds is not None else float(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "15"))
@@ -533,6 +537,10 @@ def create_app(
         raise ValueError("Timeout values must be positive")
 
     app = Flask(__name__)
+    configure_database(app, database_uri)
+    if initialize_db:
+        initialize_database(app)
+
     nodes = NodeRegistry(timeout)
     tasks = TaskRegistry()
     scheduler = RoundRobinScheduler(nodes)
