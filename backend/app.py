@@ -1,8 +1,12 @@
-"""IDCP master service for Stages 1-3.
+"""IDCP master service for Stages 1-4B.
 
 Stage 1 node state and Stage 2/3 task state are deliberately stored in
 separate in-memory registries. A later stage can replace either registry or
 the simple round-robin scheduler without changing the HTTP API.
+
+Stage 4B adds PostgreSQL persistence for node identity (Node rows) and
+heartbeat history (NodeMetric rows). The in-memory registries remain the
+authoritative source for scheduling; the database is the durable audit log.
 """
 
 from __future__ import annotations
@@ -23,8 +27,8 @@ from typing import Any, Protocol
 
 from flask import Flask, jsonify, request
 
-from database import configure_database, initialize_database
-import models  # noqa: F401  # Register SQLAlchemy models before db.create_all().
+from database import configure_database, db, initialize_database
+from models import Node, NodeMetric  # noqa: F401  # Register models before db.create_all().
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
@@ -519,6 +523,99 @@ def require_json_object() -> tuple[dict[str, Any] | None, tuple[Any, int] | None
     return payload, None
 
 
+def _parse_heartbeat_timestamp(timestamp: str) -> datetime:
+    """Convert the ISO 8601 timestamp string from a worker heartbeat payload."""
+    try:
+        return datetime.fromisoformat(timestamp)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
+def _persist_node_upsert(node: dict[str, Any]) -> None:
+    """Insert or update the Node row matching ``node['node_id']``.
+
+    Called from within an active Flask request context so ``db.session`` is
+    already bound.  Any database error is caught, logged, and rolled back so
+    the caller's in-memory state is never corrupted.
+    """
+    try:
+        db_node = db.session.execute(
+            db.select(Node).where(Node.node_id == node["node_id"])
+        ).scalar_one_or_none()
+        if db_node is None:
+            db_node = Node(
+                node_id=node["node_id"],
+                hostname=node["hostname"],
+                platform=node["platform"],
+                status=node["status"],
+                worker_url=node.get("worker_url"),
+            )
+            db.session.add(db_node)
+        else:
+            db_node.hostname = node["hostname"]
+            db_node.platform = node["platform"]
+            db_node.status = node["status"]
+            if node.get("worker_url") is not None:
+                db_node.worker_url = node["worker_url"]
+        db.session.commit()
+    except Exception:
+        logger.exception(
+            "DB write failed during registration of %s; in-memory state is intact",
+            node["node_id"],
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+def _persist_heartbeat_metric(
+    node_id: str,
+    hostname: str,
+    platform: str,
+    cpu_percent: float,
+    memory_percent: float,
+    available_memory: int,
+    hb_ts: datetime,
+) -> None:
+    """Insert one NodeMetric row and refresh the Node row after a heartbeat.
+
+    Called from within an active Flask request context.  A database failure
+    here must not propagate to the caller — the in-memory heartbeat has
+    already been recorded and the worker must receive a success response.
+    """
+    try:
+        metric = NodeMetric(
+            node_id=node_id,
+            timestamp=hb_ts,
+            cpu_percent=cpu_percent,
+            memory_percent=memory_percent,
+            available_memory=available_memory,
+            heartbeat_latency=None,  # Not yet reliably measurable from master side.
+        )
+        db.session.add(metric)
+
+        # Keep the Node row's liveness fields in sync.
+        db_node = db.session.execute(
+            db.select(Node).where(Node.node_id == node_id)
+        ).scalar_one_or_none()
+        if db_node is not None:
+            db_node.hostname = hostname
+            db_node.platform = platform
+            db_node.status = "ONLINE"
+            db_node.last_heartbeat = hb_ts
+
+        db.session.commit()
+    except Exception:
+        logger.exception(
+            "DB write failed during heartbeat from %s; in-memory state is intact", node_id
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
 def create_app(
     heartbeat_timeout_seconds: float | None = None,
     offline_check_interval_seconds: float | None = None,
@@ -615,6 +712,10 @@ def create_app(
                 if node["node_id"] not in submitted_node_ids:
                     nodes.set_task_state(node["node_id"], "IDLE")
 
+    # -----------------------------------------------------------------------
+    # Node endpoints
+    # -----------------------------------------------------------------------
+
     @app.post("/api/nodes/register")
     def register_node() -> tuple[Any, int]:
         payload, error = require_json_object()
@@ -629,6 +730,11 @@ def create_app(
             )
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
+
+        # Stage 4B: persist (or refresh) the Node row.  A DB failure is
+        # non-fatal; the in-memory registry already accepted the registration.
+        _persist_node_upsert(node)
+
         return jsonify(message="Node registered" if is_new else "Node registration refreshed", node=node), 201 if is_new else 200
 
     @app.post("/api/nodes/heartbeat")
@@ -661,12 +767,101 @@ def create_app(
         )
         if node is None:
             return jsonify(error="Node is not registered", node_id=node_id), 404
+
+        # Stage 4B: persist one NodeMetric row and keep the Node row in sync.
+        # A DB failure must not kill the heartbeat response to the worker.
+        hb_ts = _parse_heartbeat_timestamp(timestamp)
+        _persist_heartbeat_metric(
+            node_id, hostname, platform, cpu_percent, memory_percent, available_memory, hb_ts
+        )
+
         return jsonify(message="Heartbeat accepted", node=node), 200
 
     @app.get("/api/nodes")
     def list_nodes() -> tuple[Any, int]:
         node_list = nodes.list_nodes()
         return jsonify(nodes=node_list, count=len(node_list)), 200
+
+    @app.get("/api/nodes/<node_id>")
+    def get_node(node_id: str) -> tuple[Any, int]:
+        """Return node state plus the latest persisted metric from PostgreSQL."""
+        node_list = nodes.list_nodes()
+        node = next((n for n in node_list if n["node_id"] == node_id), None)
+        if node is None:
+            return jsonify(error="Node not found", node_id=node_id), 404
+
+        latest_metric: dict[str, Any] | None = None
+        try:
+            row = db.session.execute(
+                db.select(NodeMetric)
+                .where(NodeMetric.node_id == node_id)
+                .order_by(NodeMetric.timestamp.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is not None:
+                latest_metric = {
+                    "timestamp": row.timestamp.isoformat(),
+                    "cpu_percent": row.cpu_percent,
+                    "memory_percent": row.memory_percent,
+                    "available_memory": row.available_memory,
+                    "heartbeat_latency": row.heartbeat_latency,
+                }
+        except Exception:
+            logger.exception("DB read failed for latest metric of node %s", node_id)
+
+        return jsonify(**node, latest_metric=latest_metric), 200
+
+    @app.get("/api/nodes/<node_id>/metrics")
+    def get_node_metrics(node_id: str) -> tuple[Any, int]:
+        """Return paginated heartbeat history for a node, newest-first."""
+        raw_limit = request.args.get("limit", "100")
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                raise ValueError("limit must be positive")
+        except ValueError:
+            return jsonify(error="limit must be a positive integer"), 400
+
+        node_list = nodes.list_nodes()
+        node_known = any(n["node_id"] == node_id for n in node_list)
+        if not node_known:
+            # Fall back to the database in case the master was restarted.
+            try:
+                db_node = db.session.execute(
+                    db.select(Node).where(Node.node_id == node_id)
+                ).scalar_one_or_none()
+                if db_node is None:
+                    return jsonify(error="Node not found", node_id=node_id), 404
+            except Exception:
+                logger.exception("DB read failed checking existence of node %s", node_id)
+                return jsonify(error="Node not found", node_id=node_id), 404
+
+        metrics: list[dict[str, Any]] = []
+        try:
+            rows = db.session.execute(
+                db.select(NodeMetric)
+                .where(NodeMetric.node_id == node_id)
+                .order_by(NodeMetric.timestamp.desc())
+                .limit(limit)
+            ).scalars().all()
+            metrics = [
+                {
+                    "timestamp": row.timestamp.isoformat(),
+                    "cpu_percent": row.cpu_percent,
+                    "memory_percent": row.memory_percent,
+                    "available_memory": row.available_memory,
+                    "heartbeat_latency": row.heartbeat_latency,
+                }
+                for row in rows
+            ]
+        except Exception:
+            logger.exception("DB read failed for metrics of node %s", node_id)
+
+        return jsonify(node_id=node_id, count=len(metrics), metrics=metrics), 200
+
+    # -----------------------------------------------------------------------
+    # Health endpoint
+    # -----------------------------------------------------------------------
 
     @app.get("/api/health")
     def health() -> tuple[Any, int]:
@@ -681,6 +876,10 @@ def create_app(
             ),
             200,
         )
+
+    # -----------------------------------------------------------------------
+    # Task endpoints
+    # -----------------------------------------------------------------------
 
     @app.post("/api/tasks")
     def create_task() -> tuple[Any, int]:

@@ -1,8 +1,8 @@
 # Intelligent Distributive Computing Platform (IDCP)
 
-IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stages 1-3 plus **Stage 4A: PostgreSQL and SQLAlchemy foundation** on a single laptop.
+IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stages 1–3 plus **Stage 4A: PostgreSQL and SQLAlchemy foundation** and **Stage 4B: Persistent node metrics and heartbeat history** on a single laptop.
 
-It deliberately does not yet include ML, blockchain, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. Stage 4A creates the initial persistent schema; the proven Stage 1-3 registries intentionally remain in memory until a later persistence migration stage.
+It deliberately does not yet include ML, blockchain, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. Stage 4A created the initial persistent schema; Stage 4B now persists every real worker heartbeat into PostgreSQL while keeping the proven Stage 1–3 in-memory registries as the scheduling source of truth.
 
 ## What Stages 1-3 implement
 
@@ -115,8 +115,10 @@ The available APIs are:
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/nodes/register` | Register or refresh a node |
-| `POST` | `/api/nodes/heartbeat` | Submit real node metrics |
+| `POST` | `/api/nodes/heartbeat` | Submit real node metrics (persisted) |
 | `GET` | `/api/nodes` | List known nodes and live status |
+| `GET` | `/api/nodes/<node_id>` | Node detail with latest persisted metric |
+| `GET` | `/api/nodes/<node_id>/metrics` | Heartbeat history for one node |
 | `GET` | `/api/health` | Check master health and node counts |
 | `POST` | `/api/tasks` | Create and asynchronously dispatch a workload |
 | `GET` | `/api/tasks` | List all known workloads |
@@ -192,7 +194,109 @@ Stage 4A adds a PostgreSQL 16 service and a small Flask-SQLAlchemy model layer. 
 
 At startup, the master retries the database connection while PostgreSQL initializes, then calls `db.create_all()` to create the initial `nodes` table. The [Node model](backend/models.py) contains persistent node identity, endpoint, registration, heartbeat, and audit timestamp fields.
 
-This is deliberately a foundation step: current registration, heartbeat, task, subtask, and scheduler state still use the validated Stage 1-3 in-memory registries. No task/node persistence migration or database migration tooling (Alembic) has been added yet.
+This is deliberately a foundation step: current registration, heartbeat, task, subtask, and scheduler state still use the validated Stage 1–3 in-memory registries. No task/node persistence migration or database migration tooling (Alembic) has been added yet.
+
+## Stage 4B: Persistent node metrics and heartbeat history
+
+Stage 4B wires the existing heartbeat pipeline to PostgreSQL. Every valid heartbeat from a worker now produces one `NodeMetric` row, recording the real `psutil` CPU percentage, memory percentage, and available memory. The `Node` row is also kept in sync (status, hostname, platform, `last_heartbeat`).
+
+The in-memory `NodeRegistry` and `RoundRobinScheduler` remain the authoritative scheduling layer. PostgreSQL is the durable audit log, not the scheduler state.
+
+### Heartbeat persistence flow
+
+```text
+Worker (psutil)
+    ↓  heartbeat POST
+Master in-memory registry updated
+    ↓
+NodeMetric row inserted (node_id, timestamp, cpu_percent, memory_percent, available_memory)
+Node row refreshed (status, last_heartbeat)
+    ↓
+PostgreSQL
+```
+
+A transient database error is logged but does **not** return an error to the worker — heartbeat acceptance is determined by the in-memory registry alone.
+
+### Stage 4B API endpoints
+
+**`GET /api/nodes/<node_id>`**
+
+Returns node identity and live state (from in-memory registry) plus `latest_metric` from PostgreSQL:
+
+```json
+{
+  "node_id": "node-01",
+  "hostname": "abc123",
+  "platform": "Linux...",
+  "status": "ONLINE",
+  "worker_url": "http://node-01:5001",
+  "registered_at": "2026-09-23T18:10:00+00:00",
+  "last_heartbeat": "2026-09-23T18:15:30+00:00",
+  "task_state": "IDLE",
+  "cpu_percent": 12.5,
+  "memory_percent": 34.0,
+  "available_memory": 1073741824,
+  "latest_metric": {
+    "timestamp": "2026-09-23T18:15:30.123456+00:00",
+    "cpu_percent": 12.5,
+    "memory_percent": 34.0,
+    "available_memory": 1073741824,
+    "heartbeat_latency": null
+  }
+}
+```
+
+If no heartbeat has been persisted yet, `latest_metric` is `null`.
+
+**`GET /api/nodes/<node_id>/metrics?limit=N`**
+
+Returns the most recent `N` heartbeat samples for a node, newest-first. Default `limit` is 100.
+
+```json
+{
+  "node_id": "node-01",
+  "count": 3,
+  "metrics": [
+    {"timestamp": "...", "cpu_percent": 15.0, "memory_percent": 40.0, "available_memory": 900000000, "heartbeat_latency": null},
+    {"timestamp": "...", "cpu_percent": 12.0, "memory_percent": 38.5, "available_memory": 920000000, "heartbeat_latency": null},
+    {"timestamp": "...", "cpu_percent": 10.0, "memory_percent": 37.0, "available_memory": 940000000, "heartbeat_latency": null}
+  ]
+}
+```
+
+Invalid `limit` values (non-integer, zero, negative) return `400`. Unknown node IDs return `404`.
+
+### `heartbeat_latency`
+
+This field is always `null` in Stage 4B. Reliable latency measurement requires a round-trip timestamp protocol that has not been added to the worker yet. The column exists in the schema for a future stage.
+
+### Offline node behaviour
+
+- When a node misses its heartbeat window, the master marks it `OFFLINE` in memory (unchanged from Stage 1).
+- No `NodeMetric` rows are created while a node is offline — there are no fabricated or zero-valued metrics.
+- Historical metrics before the outage are preserved.
+- When the node recovers (registers and heartbeats again), it becomes `ONLINE` and new `NodeMetric` rows resume.
+
+### Verify with Docker
+
+After the stack is running and nodes have sent several heartbeats:
+
+```powershell
+# Node detail with latest metric
+curl.exe http://localhost:5000/api/nodes/node-01
+
+# Last 10 heartbeat samples (newest-first)
+curl.exe "http://localhost:5000/api/nodes/node-01/metrics?limit=10"
+```
+
+### Inspect PostgreSQL directly
+
+```powershell
+$db   = (Get-Content .env | Where-Object { $_ -match 'POSTGRES_DB' }).Split('=')[1]
+$user = (Get-Content .env | Where-Object { $_ -match 'POSTGRES_USER' }).Split('=')[1]
+$id   = docker compose ps -q postgres
+docker exec -it $id psql -U $user -d $db -c "SELECT node_id, COUNT(*) FROM node_metrics GROUP BY node_id;"
+```
 
 ## Test node failure and recovery
 
@@ -222,12 +326,19 @@ To confirm Stage 3 avoids an offline worker, stop `node-01`, wait for its `OFFLI
 
 ## Automated tests
 
-Lightweight `unittest` coverage is in `tests/test_stage2.py`, `tests/test_stage3.py`, and `tests/test_database.py`. It covers Stage 2 single-node compatibility, Stage 3 splitting/aggregation, and the Stage 4A schema/configuration foundation.
+Lightweight `unittest` coverage is in `tests/`. The suite covers:
+
+- `test_database.py` — Stage 4A schema, Node model, and connection retry logic.
+- `test_stage2.py` — Stage 2 single-node execution regression.
+- `test_stage3.py` — Stage 3 range splitting, aggregation, failure, and scheduler tests.
+- `test_stage4b.py` — Stage 4B: `NodeMetric` model, heartbeat persistence, multiple records, real metric values, metrics API (basic / limit / ordering), node detail API (basic / `latest_metric`), no duplicate Node rows, offline detection without fake metrics, node recovery, and Stage 2/3 regression.
+
+All tests use an in-memory SQLite database so no running PostgreSQL instance is needed.
 
 With Python dependencies installed locally, run:
 
 ```powershell
-python -m unittest discover -s tests -v
+py -3.14 -m unittest discover -s tests -v
 ```
 
 ## Configuration
