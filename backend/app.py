@@ -25,10 +25,12 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from flask import Flask, jsonify, request
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload
 
 from database import configure_database, db, initialize_database
 from models import Event, Node, NodeMetric, Subtask, Task  # noqa: F401  # Register models before db.create_all().
@@ -40,6 +42,10 @@ logger = logging.getLogger("idcp.master")
 TASK_TYPE_SUM_RANGE = "sum_range"
 NODE_TASK_STATES = {"IDLE", "BUSY"}
 MAX_SUBTASKS = 3
+
+MAX_LIMIT_METRICS = 1000
+MAX_LIMIT_TASKS = 500
+MAX_LIMIT_EVENTS = 500
 
 
 def utc_now() -> str:
@@ -1231,6 +1237,7 @@ def create_app(
                 raise ValueError("limit must be positive")
         except ValueError:
             return jsonify(error="limit must be a positive integer"), 400
+        limit = min(limit, MAX_LIMIT_METRICS)
 
         node_list = nodes.list_nodes()
         node_known = any(n["node_id"] == node_id for n in node_list)
@@ -1267,6 +1274,96 @@ def create_app(
             logger.exception("DB read failed for metrics of node %s", node_id)
 
         return jsonify(node_id=node_id, count=len(metrics), metrics=metrics), 200
+
+    # -----------------------------------------------------------------------
+    # System monitoring summary endpoint
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/monitoring/summary")
+    def monitoring_summary() -> tuple[Any, int]:
+        """Compact system-level monitoring overview for master, workers, tasks, and events."""
+        offline_nodes = nodes.mark_timed_out_nodes_offline()
+        _persist_node_offline(app, offline_nodes)
+
+        # 1. Node runtime counts from NodeRegistry
+        node_list = nodes.list_nodes()
+        total_nodes = len(node_list)
+        online_nodes_list = [n for n in node_list if n.get("status") == "ONLINE"]
+        online_nodes = len(online_nodes_list)
+        offline_nodes_count = total_nodes - online_nodes
+        busy_nodes = sum(1 for n in online_nodes_list if n.get("task_state") == "BUSY")
+        idle_nodes = sum(1 for n in online_nodes_list if n.get("task_state") == "IDLE")
+
+        # 2. Cluster CPU/Memory metrics snapshot derived strictly from current ONLINE nodes
+        online_cpus = [n["cpu_percent"] for n in online_nodes_list if n.get("cpu_percent") is not None]
+        online_mems = [n["memory_percent"] for n in online_nodes_list if n.get("memory_percent") is not None]
+        online_avail = [n["available_memory"] for n in online_nodes_list if n.get("available_memory") is not None]
+
+        avg_cpu = round(sum(online_cpus) / len(online_cpus), 2) if online_cpus else None
+        avg_mem = round(sum(online_mems) / len(online_mems), 2) if online_mems else None
+        tot_avail = sum(online_avail) if online_avail else None
+
+        # 3. Active task counts from in-memory TaskRegistry
+        in_memory_tasks = tasks.list()
+        active_tasks = sum(1 for t in in_memory_tasks if t.get("status") in {"CREATED", "SPLIT", "RUNNING", "AGGREGATING"})
+
+        # 4. Historical task counts & total events from PostgreSQL
+        completed_tasks = 0
+        failed_tasks = 0
+        total_tasks_db = 0
+        total_events = 0
+        recent_events_count_24h = 0
+
+        try:
+            total_tasks_db = db.session.execute(db.select(func.count(Task.id))).scalar() or 0
+            completed_tasks = db.session.execute(
+                db.select(func.count(Task.id)).where(Task.status == "COMPLETED")
+            ).scalar() or 0
+            failed_tasks = db.session.execute(
+                db.select(func.count(Task.id)).where(Task.status == "FAILED")
+            ).scalar() or 0
+        except Exception:
+            logger.exception("DB read failed for task metrics in monitoring summary")
+
+        try:
+            total_events = db.session.execute(db.select(func.count(Event.id))).scalar() or 0
+            cutoff_24h = datetime.now(timezone.utc) - timedelta(days=1)
+            recent_events_count_24h = db.session.execute(
+                db.select(func.count(Event.id)).where(Event.timestamp >= cutoff_24h)
+            ).scalar() or 0
+        except Exception:
+            logger.exception("DB read failed for event metrics in monitoring summary")
+
+        total_tasks = max(total_tasks_db, len(in_memory_tasks))
+
+        return jsonify(
+            status="healthy",
+            service="idcp-master",
+            timestamp=utc_now(),
+            nodes={
+                "total_nodes": total_nodes,
+                "online_nodes": online_nodes,
+                "offline_nodes": offline_nodes_count,
+                "busy_nodes": busy_nodes,
+                "idle_nodes": idle_nodes,
+            },
+            cluster_metrics={
+                "average_cpu_percent": avg_cpu,
+                "average_memory_percent": avg_mem,
+                "total_available_memory": tot_avail,
+                "online_nodes_included": online_nodes,
+            },
+            tasks={
+                "total_tasks": total_tasks,
+                "active_tasks": active_tasks,
+                "completed_tasks": completed_tasks,
+                "failed_tasks": failed_tasks,
+            },
+            events={
+                "total_events": total_events,
+                "recent_events_count_24h": recent_events_count_24h,
+            },
+        ), 200
 
     # -----------------------------------------------------------------------
     # Health endpoint
@@ -1322,12 +1419,16 @@ def create_app(
                 raise ValueError("limit must be positive")
         except ValueError:
             return jsonify(error="limit must be a positive integer"), 400
+        limit = min(limit, MAX_LIMIT_TASKS)
 
         tasks_list: list[dict[str, Any]] = []
         try:
             rows = db.session.execute(
-                db.select(Task).order_by(Task.created_at.desc()).limit(limit)
-            ).scalars().all()
+                db.select(Task)
+                .options(joinedload(Task.subtasks))
+                .order_by(Task.created_at.desc())
+                .limit(limit)
+            ).unique().scalars().all()
             for row in rows:
                 subtasks_list = [
                     {
@@ -1434,6 +1535,7 @@ def create_app(
                 raise ValueError("limit must be positive")
         except ValueError:
             return jsonify(error="limit must be a positive integer"), 400
+        limit = min(limit, MAX_LIMIT_EVENTS)
 
         event_type = request.args.get("event_type")
         task_id = request.args.get("task_id")
