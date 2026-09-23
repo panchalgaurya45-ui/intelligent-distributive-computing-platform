@@ -1,12 +1,15 @@
-"""IDCP master service for Stages 1-4B.
+"""IDCP master service for Stages 1-4C.
 
 Stage 1 node state and Stage 2/3 task state are deliberately stored in
 separate in-memory registries. A later stage can replace either registry or
 the simple round-robin scheduler without changing the HTTP API.
 
-Stage 4B adds PostgreSQL persistence for node identity (Node rows) and
-heartbeat history (NodeMetric rows). The in-memory registries remain the
-authoritative source for scheduling; the database is the durable audit log.
+Stage 4B added PostgreSQL persistence for node identity (Node rows) and
+heartbeat history (NodeMetric rows).
+Stage 4C adds PostgreSQL persistence for task execution history (Task rows),
+subtask execution history (Subtask rows), and system audit events (Event rows).
+The in-memory registries remain the authoritative source for scheduling;
+the database is the durable audit log and historical record.
 """
 
 from __future__ import annotations
@@ -20,15 +23,15 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from flask import Flask, jsonify, request
 
 from database import configure_database, db, initialize_database
-from models import Node, NodeMetric  # noqa: F401  # Register models before db.create_all().
+from models import Event, Node, NodeMetric, Subtask, Task  # noqa: F401  # Register models before db.create_all().
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
@@ -42,6 +45,16 @@ MAX_SUBTASKS = 3
 def utc_now() -> str:
     """Return an ISO 8601 UTC timestamp suitable for JSON responses."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_timestamp(ts_str: str | None) -> datetime | None:
+    """Safely parse an ISO 8601 timestamp string into a datetime object."""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str)
+    except Exception:
+        return datetime.now(timezone.utc)
 
 
 class NodeRegistry:
@@ -58,8 +71,8 @@ class NodeRegistry:
         hostname: str,
         platform: str,
         worker_url: str | None = None,
-    ) -> tuple[dict[str, Any], bool]:
-        """Register or refresh a node and return a copy plus whether it is new."""
+    ) -> tuple[dict[str, Any], bool, bool]:
+        """Register or refresh a node and return (public_copy, is_new, was_offline)."""
         with self._lock:
             existing = self._nodes.get(node_id)
             now = time.monotonic()
@@ -80,7 +93,7 @@ class NodeRegistry:
                 }
                 self._nodes[node_id] = node
                 logger.info("Node registered: %s (%s, %s)", node_id, hostname, platform)
-                return self._public_copy(node), True
+                return self._public_copy(node), True, False
 
             was_offline = existing["status"] == "OFFLINE"
             existing.update(
@@ -96,7 +109,7 @@ class NodeRegistry:
                 logger.info("Node is ONLINE again after registration: %s", node_id)
             else:
                 logger.info("Node registration refreshed: %s", node_id)
-            return self._public_copy(existing), False
+            return self._public_copy(existing), False, was_offline
 
     def heartbeat(
         self,
@@ -107,12 +120,12 @@ class NodeRegistry:
         memory_percent: float,
         available_memory: int,
         timestamp: str,
-    ) -> dict[str, Any] | None:
-        """Store a heartbeat, or return None if its node has not registered."""
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Store a heartbeat, or return (None, False) if its node has not registered."""
         with self._lock:
             node = self._nodes.get(node_id)
             if node is None:
-                return None
+                return None, False
 
             was_offline = node["status"] == "OFFLINE"
             node.update(
@@ -133,7 +146,7 @@ class NodeRegistry:
                 cpu_percent,
                 memory_percent,
             )
-            return self._public_copy(node)
+            return self._public_copy(node), was_offline
 
     def mark_timed_out_nodes_offline(self) -> list[str]:
         """Mark nodes that have missed the configured heartbeat window OFFLINE."""
@@ -196,12 +209,7 @@ class NodeRegistry:
 
 
 class RoundRobinScheduler:
-    """Choose ONLINE, IDLE workers in round-robin order.
-
-    Stage 2 calls ``select_node`` for a single workload. Stage 3 calls
-    ``select_nodes`` to atomically claim a set of workers for one parent task.
-    A future risk-aware scheduler can retain these interfaces.
-    """
+    """Choose ONLINE, IDLE workers in round-robin order."""
 
     def __init__(self, nodes: NodeRegistry) -> None:
         self.nodes = nodes
@@ -313,17 +321,21 @@ class TaskRegistry:
         logger.info("Task %s split into %s subtask(s)", task_id, len(created_subtasks))
         return deepcopy(created_subtasks)
 
-    def mark_subtask_running(self, task_id: str, subtask_id: str) -> bool:
+    def mark_subtask_running(self, task_id: str, subtask_id: str) -> tuple[bool, bool]:
+        """Mark subtask running and return (success, parent_was_split_and_now_running)."""
         with self._lock:
             task = self._tasks.get(task_id)
             subtask = self._find_subtask(task, subtask_id)
             if subtask is None or subtask["status"] != "ASSIGNED":
-                return False
-            subtask.update(status="RUNNING", started_at=utc_now())
+                return False, False
+            now_ts = utc_now()
+            subtask.update(status="RUNNING", started_at=now_ts)
+            parent_started = False
             if task["status"] == "SPLIT":
-                task.update(status="RUNNING", started_at=utc_now())
+                task.update(status="RUNNING", started_at=now_ts)
+                parent_started = True
         logger.info("Subtask %s is RUNNING", subtask_id)
-        return True
+        return True, parent_started
 
     def complete_subtask(self, task_id: str, subtask_id: str, result: int) -> bool:
         """Store a worker result and aggregate only after every subtask succeeds."""
@@ -343,14 +355,11 @@ class TaskRegistry:
             if task["completed_subtasks"] != task["total_subtasks"]:
                 return True
 
-            # The master aggregates worker-returned partial results; it never
-            # recalculates the original range itself.
             task["status"] = "AGGREGATING"
             final_result = sum(candidate["result"] for candidate in task["subtasks"])
             task.update(
                 status="COMPLETED",
                 final_result=final_result,
-                # ``result`` remains for Stage 2 clients that read this field.
                 result=final_result,
                 completed_at=utc_now(),
             )
@@ -399,104 +408,119 @@ class TaskRegistry:
         return next((subtask for subtask in task["subtasks"] if subtask["subtask_id"] == subtask_id), None)
 
 
+class TaskSubmitter(Protocol):
+    def submit(self, function: Any, /, *args: Any, **kwargs: Any) -> Any: ...
+
+
 class WorkerTaskError(Exception):
-    """A safe, user-facing summary of a worker execution problem."""
+    """Raised when a worker node cannot complete a task cleanly."""
 
 
 class WorkerTaskClient:
-    """Small HTTP boundary between master dispatch and a node agent."""
+    """HTTP client for dispatching subtasks to worker node agents."""
 
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = timeout_seconds
 
     def execute(self, worker_url: str, payload: dict[str, Any]) -> int:
-        request_body = json.dumps(payload).encode("utf-8")
-        request_object = urllib.request.Request(
-            f"{worker_url.rstrip('/')}/api/tasks/execute",
-            data=request_body,
+        endpoint = f"{worker_url.rstrip('/')}/api/tasks/execute"
+        body = json.dumps(payload).encode("utf-8")
+        request_obj = urllib.request.Request(
+            endpoint,
+            data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request_object, timeout=self.timeout_seconds) as response:
-                response_body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            logger.warning("Worker rejected task %s with HTTP %s", payload["task_id"], exc.code)
-            raise WorkerTaskError("Worker rejected the task") from exc
+            with urllib.request.urlopen(request_obj, timeout=self.timeout_seconds) as response:
+                status_code = response.status
+                raw_response = response.read().decode("utf-8")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.warning("Worker communication failed for task %s: %s", payload["task_id"], exc)
-            raise WorkerTaskError("Worker could not be reached") from exc
+            raise WorkerTaskError(f"Worker request failed: {exc}") from exc
+
+        if status_code != 200:
+            raise WorkerTaskError(f"Worker returned status code {status_code}: {raw_response}")
 
         try:
-            result_payload = json.loads(response_body)
-            result = result_payload.get("result")
-            if result_payload.get("status") != "COMPLETED" or isinstance(result, bool) or not isinstance(result, int):
-                raise ValueError("invalid worker response")
-            return result_payload["result"]
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Worker returned an invalid response for task %s", payload["task_id"])
-            raise WorkerTaskError("Worker returned an invalid result") from exc
+            data = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            raise WorkerTaskError("Worker response was not valid JSON") from exc
 
+        if not isinstance(data, dict):
+            raise WorkerTaskError("Worker response body must be a JSON object")
 
-class TaskSubmitter(Protocol):
-    """Subset of an executor used for dispatch; keeps tests lightweight."""
+        if data.get("status") != "COMPLETED" or "result" not in data:
+            error_message = data.get("error", "Unknown worker execution error")
+            raise WorkerTaskError(f"Worker task failed: {error_message}")
 
-    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any: ...
-
-
-def parse_positive_number(value: Any, field_name: str, *, maximum: float | None = None) -> float:
-    """Validate and convert JSON numeric fields, rejecting NaN and infinity."""
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be a number")
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be a number") from exc
-    if not math.isfinite(number) or number < 0 or (maximum is not None and number > maximum):
-        limit = f" between 0 and {maximum:g}" if maximum is not None else " greater than or equal to 0"
-        raise ValueError(f"{field_name} must be{limit}")
-    return number
+        try:
+            return int(data["result"])
+        except (TypeError, ValueError) as exc:
+            raise WorkerTaskError("Worker result must be an integer") from exc
 
 
 def required_text(payload: dict[str, Any], field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} is required and must be a non-empty string")
+        raise ValueError(f"Field '{field_name}' must be a non-empty string")
     return value.strip()
+
+
+def parse_positive_number(
+    value: Any, field_name: str, maximum: float | None = None
+) -> float:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"Field '{field_name}' must be a positive number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Field '{field_name}' must be a positive number")
+
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError(f"Field '{field_name}' must be a positive number")
+    if maximum is not None and numeric > maximum:
+        raise ValueError(f"Field '{field_name}' cannot exceed {maximum}")
+    return numeric
 
 
 def optional_worker_url(payload: dict[str, Any]) -> str | None:
     value = payload.get("worker_url")
     if value is None:
         return None
-    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
-        raise ValueError("worker_url must be an HTTP(S) URL")
-    return value.rstrip("/")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Field 'worker_url' must be a non-empty string when provided")
+    url = value.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("Field 'worker_url' must start with http:// or https://")
+    return url
 
 
 def parse_sum_range_task(payload: dict[str, Any]) -> tuple[str, int, int]:
-    """Validate the one intentionally small Stage 2 task contract."""
     task_type = required_text(payload, "task_type")
     if task_type != TASK_TYPE_SUM_RANGE:
         raise ValueError(f"Unsupported task_type: {task_type}")
 
-    start = payload.get("start")
-    end = payload.get("end")
-    if isinstance(start, bool) or not isinstance(start, int):
-        raise ValueError("start must be an integer")
-    if isinstance(end, bool) or not isinstance(end, int):
-        raise ValueError("end must be an integer")
-    if start > end:
-        raise ValueError("start must be less than or equal to end")
-    return task_type, start, end
+    params = payload.get("parameters")
+    if isinstance(params, dict):
+        start_val = params.get("start")
+        end_val = params.get("end")
+    else:
+        start_val = payload.get("start")
+        end_val = payload.get("end")
+
+    if start_val is None or isinstance(start_val, bool) or not isinstance(start_val, int):
+        raise ValueError("Parameter 'start' must be an integer")
+    if end_val is None or isinstance(end_val, bool) or not isinstance(end_val, int):
+        raise ValueError("Parameter 'end' must be an integer")
+
+    if start_val > end_val:
+        raise ValueError("Parameter 'start' must be less than or equal to 'end'")
+
+    return task_type, start_val, end_val
 
 
 def split_range(start: int, end: int, parts: int) -> list[tuple[int, int]]:
-    """Split an inclusive integer range into balanced, contiguous non-empty parts.
-
-    Extra values are assigned to the earlier ranges, so ``1..10`` split across
-    three workers becomes ``1..4``, ``5..7``, and ``8..10``.
-    """
+    """Split an inclusive range into ``parts`` contiguous sub-ranges."""
     if parts <= 0:
         raise ValueError("parts must be greater than zero")
     total_values = end - start + 1
@@ -531,45 +555,64 @@ def _parse_heartbeat_timestamp(timestamp: str) -> datetime:
         return datetime.now(timezone.utc)
 
 
-def _persist_node_upsert(node: dict[str, Any]) -> None:
-    """Insert or update the Node row matching ``node['node_id']``.
-
-    Called from within an active Flask request context so ``db.session`` is
-    already bound.  Any database error is caught, logged, and rolled back so
-    the caller's in-memory state is never corrupted.
-    """
-    try:
-        db_node = db.session.execute(
-            db.select(Node).where(Node.node_id == node["node_id"])
-        ).scalar_one_or_none()
-        if db_node is None:
-            db_node = Node(
-                node_id=node["node_id"],
-                hostname=node["hostname"],
-                platform=node["platform"],
-                status=node["status"],
-                worker_url=node.get("worker_url"),
-            )
-            db.session.add(db_node)
-        else:
-            db_node.hostname = node["hostname"]
-            db_node.platform = node["platform"]
-            db_node.status = node["status"]
-            if node.get("worker_url") is not None:
-                db_node.worker_url = node["worker_url"]
-        db.session.commit()
-    except Exception:
-        logger.exception(
-            "DB write failed during registration of %s; in-memory state is intact",
-            node["node_id"],
-        )
+def _persist_node_upsert(
+    app: Flask, node: dict[str, Any], is_new: bool = False, was_offline: bool = False
+) -> None:
+    """Insert or update the Node row and log corresponding registration events."""
+    with app.app_context():
         try:
-            db.session.rollback()
+            db_node = db.session.execute(
+                db.select(Node).where(Node.node_id == node["node_id"])
+            ).scalar_one_or_none()
+            if db_node is None:
+                db_node = Node(
+                    node_id=node["node_id"],
+                    hostname=node["hostname"],
+                    platform=node["platform"],
+                    status=node["status"],
+                    worker_url=node.get("worker_url"),
+                )
+                db.session.add(db_node)
+            else:
+                db_node.hostname = node["hostname"]
+                db_node.platform = node["platform"]
+                db_node.status = node["status"]
+                if node.get("worker_url") is not None:
+                    db_node.worker_url = node["worker_url"]
+
+            if is_new:
+                db.session.add(
+                    Event(
+                        event_type="NODE_REGISTERED",
+                        message=f"Node {node['node_id']} registered ({node['hostname']}, {node['platform']})",
+                        node_id=node["node_id"],
+                        severity="INFO",
+                    )
+                )
+            elif was_offline:
+                db.session.add(
+                    Event(
+                        event_type="NODE_ONLINE",
+                        message=f"Node {node['node_id']} is ONLINE again after registration",
+                        node_id=node["node_id"],
+                        severity="INFO",
+                    )
+                )
+
+            db.session.commit()
         except Exception:
-            pass
+            logger.exception(
+                "DB write failed during registration of %s; in-memory state is intact",
+                node["node_id"],
+            )
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
 
 
 def _persist_heartbeat_metric(
+    app: Flask,
     node_id: str,
     hostname: str,
     platform: str,
@@ -577,43 +620,400 @@ def _persist_heartbeat_metric(
     memory_percent: float,
     available_memory: int,
     hb_ts: datetime,
+    was_offline: bool = False,
 ) -> None:
-    """Insert one NodeMetric row and refresh the Node row after a heartbeat.
-
-    Called from within an active Flask request context.  A database failure
-    here must not propagate to the caller — the in-memory heartbeat has
-    already been recorded and the worker must receive a success response.
-    """
-    try:
-        metric = NodeMetric(
-            node_id=node_id,
-            timestamp=hb_ts,
-            cpu_percent=cpu_percent,
-            memory_percent=memory_percent,
-            available_memory=available_memory,
-            heartbeat_latency=None,  # Not yet reliably measurable from master side.
-        )
-        db.session.add(metric)
-
-        # Keep the Node row's liveness fields in sync.
-        db_node = db.session.execute(
-            db.select(Node).where(Node.node_id == node_id)
-        ).scalar_one_or_none()
-        if db_node is not None:
-            db_node.hostname = hostname
-            db_node.platform = platform
-            db_node.status = "ONLINE"
-            db_node.last_heartbeat = hb_ts
-
-        db.session.commit()
-    except Exception:
-        logger.exception(
-            "DB write failed during heartbeat from %s; in-memory state is intact", node_id
-        )
+    """Insert one NodeMetric row and refresh the Node row after a heartbeat."""
+    with app.app_context():
         try:
-            db.session.rollback()
+            metric = NodeMetric(
+                node_id=node_id,
+                timestamp=hb_ts,
+                cpu_percent=cpu_percent,
+                memory_percent=memory_percent,
+                available_memory=available_memory,
+                heartbeat_latency=None,
+            )
+            db.session.add(metric)
+
+            db_node = db.session.execute(
+                db.select(Node).where(Node.node_id == node_id)
+            ).scalar_one_or_none()
+            if db_node is not None:
+                db_node.hostname = hostname
+                db_node.platform = platform
+                db_node.status = "ONLINE"
+                db_node.last_heartbeat = hb_ts
+
+            if was_offline:
+                db.session.add(
+                    Event(
+                        event_type="NODE_ONLINE",
+                        message=f"Node {node_id} is ONLINE again after heartbeat",
+                        node_id=node_id,
+                        severity="INFO",
+                        timestamp=hb_ts,
+                    )
+                )
+
+            db.session.commit()
         except Exception:
-            pass
+            logger.exception(
+                "DB write failed during heartbeat from %s; in-memory state is intact", node_id
+            )
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_node_offline(app: Flask, offline_node_ids: list[str]) -> None:
+    """Record NODE_OFFLINE event and update Node status in DB when timeout occurs."""
+    if not offline_node_ids:
+        return
+    with app.app_context():
+        try:
+            for node_id in offline_node_ids:
+                db_node = db.session.execute(
+                    db.select(Node).where(Node.node_id == node_id)
+                ).scalar_one_or_none()
+                if db_node is not None:
+                    db_node.status = "OFFLINE"
+                db.session.add(
+                    Event(
+                        event_type="NODE_OFFLINE",
+                        message=f"Node {node_id} marked OFFLINE due to heartbeat timeout",
+                        node_id=node_id,
+                        severity="WARNING",
+                    )
+                )
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed setting nodes offline: %s", offline_node_ids)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_task_created(app: Flask, task: dict[str, Any]) -> None:
+    """Persist a newly created Task row and TASK_CREATED event."""
+    with app.app_context():
+        try:
+            ts = _parse_iso_timestamp(task.get("created_at")) or datetime.now(timezone.utc)
+            db_task = Task(
+                task_id=task["task_id"],
+                task_type=task["task_type"],
+                status=task["status"],
+                start=task.get("start"),
+                end=task.get("end"),
+                total_subtasks=0,
+                completed_subtasks=0,
+                failed_subtasks=0,
+                created_at=ts,
+            )
+            db.session.add(db_task)
+            db.session.add(
+                Event(
+                    event_type="TASK_CREATED",
+                    message=f"Task {task['task_id']} created ({task['task_type']}, {task.get('start')}..{task.get('end')})",
+                    task_id=task["task_id"],
+                    severity="INFO",
+                    timestamp=ts,
+                )
+            )
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed creating task %s", task.get("task_id"))
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_task_split_and_subtasks(
+    app: Flask,
+    task_id: str,
+    total_subtasks: int,
+    created_subtasks: list[dict[str, Any]],
+) -> None:
+    """Persist task status SPLIT, Subtask rows, and split/assignment events."""
+    with app.app_context():
+        try:
+            db_task = db.session.execute(
+                db.select(Task).where(Task.task_id == task_id)
+            ).scalar_one_or_none()
+            if db_task is not None:
+                db_task.status = "SPLIT"
+                db_task.total_subtasks = total_subtasks
+
+            db.session.add(
+                Event(
+                    event_type="TASK_ASSIGNED",
+                    message=f"Task {task_id} split into {total_subtasks} subtask(s)",
+                    task_id=task_id,
+                    severity="INFO",
+                )
+            )
+
+            for subtask in created_subtasks:
+                ts = _parse_iso_timestamp(subtask.get("created_at")) or datetime.now(timezone.utc)
+                db_subtask = Subtask(
+                    subtask_id=subtask["subtask_id"],
+                    parent_task_id=task_id,
+                    node_id=subtask.get("assigned_node"),
+                    task_type=subtask["task_type"],
+                    status=subtask["status"],
+                    start=subtask.get("start"),
+                    end=subtask.get("end"),
+                    created_at=ts,
+                )
+                db.session.add(db_subtask)
+
+                db.session.add(
+                    Event(
+                        event_type="SUBTASK_CREATED",
+                        message=f"Subtask {subtask['subtask_id']} created",
+                        task_id=task_id,
+                        subtask_id=subtask["subtask_id"],
+                        node_id=subtask.get("assigned_node"),
+                        severity="INFO",
+                        timestamp=ts,
+                    )
+                )
+
+                db.session.add(
+                    Event(
+                        event_type="SUBTASK_ASSIGNED",
+                        message=f"Subtask {subtask['subtask_id']} assigned to node {subtask.get('assigned_node')}",
+                        task_id=task_id,
+                        subtask_id=subtask["subtask_id"],
+                        node_id=subtask.get("assigned_node"),
+                        severity="INFO",
+                        timestamp=ts,
+                    )
+                )
+
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed persisting subtasks for task %s", task_id)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_subtask_running(
+    app: Flask,
+    task_id: str,
+    subtask_id: str,
+    parent_started: bool,
+) -> None:
+    """Persist SUBTASK_STARTED event and optionally TASK_STARTED event."""
+    with app.app_context():
+        try:
+            ts = datetime.now(timezone.utc)
+            db_subtask = db.session.execute(
+                db.select(Subtask).where(Subtask.subtask_id == subtask_id)
+            ).scalar_one_or_none()
+            node_id = None
+            if db_subtask is not None:
+                db_subtask.status = "RUNNING"
+                db_subtask.started_at = ts
+                node_id = db_subtask.node_id
+
+            db.session.add(
+                Event(
+                    event_type="SUBTASK_STARTED",
+                    message=f"Subtask {subtask_id} started execution",
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    node_id=node_id,
+                    severity="INFO",
+                    timestamp=ts,
+                )
+            )
+
+            if parent_started:
+                db_task = db.session.execute(
+                    db.select(Task).where(Task.task_id == task_id)
+                ).scalar_one_or_none()
+                if db_task is not None:
+                    db_task.status = "RUNNING"
+                    db_task.started_at = ts
+                db.session.add(
+                    Event(
+                        event_type="TASK_STARTED",
+                        message=f"Task {task_id} execution started",
+                        task_id=task_id,
+                        severity="INFO",
+                        timestamp=ts,
+                    )
+                )
+
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed marking subtask %s running", subtask_id)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_subtask_completed(
+    app: Flask,
+    task_id: str,
+    subtask_id: str,
+    result: int,
+    task_snapshot: dict[str, Any],
+) -> None:
+    """Persist SUBTASK_COMPLETED event, update subtask result, and update parent task if complete."""
+    with app.app_context():
+        try:
+            ts = datetime.now(timezone.utc)
+            db_subtask = db.session.execute(
+                db.select(Subtask).where(Subtask.subtask_id == subtask_id)
+            ).scalar_one_or_none()
+            node_id = None
+            if db_subtask is not None:
+                db_subtask.status = "COMPLETED"
+                db_subtask.result = result
+                db_subtask.completed_at = ts
+                node_id = db_subtask.node_id
+
+            db.session.add(
+                Event(
+                    event_type="SUBTASK_COMPLETED",
+                    message=f"Subtask {subtask_id} completed with result {result}",
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    node_id=node_id,
+                    severity="INFO",
+                    timestamp=ts,
+                )
+            )
+
+            db_task = db.session.execute(
+                db.select(Task).where(Task.task_id == task_id)
+            ).scalar_one_or_none()
+            if db_task is not None:
+                db_task.completed_subtasks = task_snapshot.get("completed_subtasks", 0)
+                if task_snapshot.get("status") == "COMPLETED":
+                    db_task.status = "COMPLETED"
+                    db_task.final_result = task_snapshot.get("final_result")
+                    comp_ts = _parse_iso_timestamp(task_snapshot.get("completed_at")) or ts
+                    db_task.completed_at = comp_ts
+                    db.session.add(
+                        Event(
+                            event_type="TASK_COMPLETED",
+                            message=f"Task {task_id} completed with final result {task_snapshot.get('final_result')}",
+                            task_id=task_id,
+                            severity="INFO",
+                            timestamp=comp_ts,
+                        )
+                    )
+
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed completing subtask %s", subtask_id)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_subtask_failed(
+    app: Flask,
+    task_id: str,
+    subtask_id: str,
+    error: str,
+    task_snapshot: dict[str, Any],
+) -> None:
+    """Persist SUBTASK_FAILED event, subtask error, and update parent task to FAILED."""
+    with app.app_context():
+        try:
+            ts = datetime.now(timezone.utc)
+            db_subtask = db.session.execute(
+                db.select(Subtask).where(Subtask.subtask_id == subtask_id)
+            ).scalar_one_or_none()
+            node_id = None
+            if db_subtask is not None:
+                db_subtask.status = "FAILED"
+                db_subtask.error = error
+                db_subtask.completed_at = ts
+                node_id = db_subtask.node_id
+
+            db.session.add(
+                Event(
+                    event_type="SUBTASK_FAILED",
+                    message=f"Subtask {subtask_id} failed: {error}",
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    node_id=node_id,
+                    severity="ERROR",
+                    timestamp=ts,
+                )
+            )
+
+            db_task = db.session.execute(
+                db.select(Task).where(Task.task_id == task_id)
+            ).scalar_one_or_none()
+            if db_task is not None:
+                db_task.status = "FAILED"
+                db_task.failed_subtasks = task_snapshot.get("failed_subtasks", 1)
+                db_task.error = task_snapshot.get("error")
+                comp_ts = _parse_iso_timestamp(task_snapshot.get("completed_at")) or ts
+                db_task.completed_at = comp_ts
+                db.session.add(
+                    Event(
+                        event_type="TASK_FAILED",
+                        message=f"Task {task_id} failed: {task_snapshot.get('error')}",
+                        task_id=task_id,
+                        severity="ERROR",
+                        timestamp=comp_ts,
+                    )
+                )
+
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed marking subtask %s failed", subtask_id)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+def _persist_parent_failed(
+    app: Flask,
+    task_id: str,
+    error: str,
+) -> None:
+    """Persist parent task failure when dispatch cannot split or find workers."""
+    with app.app_context():
+        try:
+            ts = datetime.now(timezone.utc)
+            db_task = db.session.execute(
+                db.select(Task).where(Task.task_id == task_id)
+            ).scalar_one_or_none()
+            if db_task is not None:
+                db_task.status = "FAILED"
+                db_task.error = error
+                db_task.completed_at = ts
+            db.session.add(
+                Event(
+                    event_type="TASK_FAILED",
+                    message=f"Task {task_id} failed: {error}",
+                    task_id=task_id,
+                    severity="ERROR",
+                    timestamp=ts,
+                )
+            )
+            db.session.commit()
+        except Exception:
+            logger.exception("DB write failed failing parent task %s", task_id)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
 
 
 def create_app(
@@ -659,8 +1059,11 @@ def create_app(
         subtask_id = subtask["subtask_id"]
         node_id = node["node_id"]
         try:
-            if not tasks.mark_subtask_running(parent_task_id, subtask_id):
+            marked, parent_started = tasks.mark_subtask_running(parent_task_id, subtask_id)
+            if not marked:
                 return
+            _persist_subtask_running(app, parent_task_id, subtask_id, parent_started)
+
             result = client.execute(
                 node["worker_url"],
                 {
@@ -670,11 +1073,17 @@ def create_app(
                 },
             )
             tasks.complete_subtask(parent_task_id, subtask_id, result)
+            task_snapshot = tasks.get(parent_task_id) or {}
+            _persist_subtask_completed(app, parent_task_id, subtask_id, result, task_snapshot)
         except WorkerTaskError as exc:
             tasks.fail_subtask(parent_task_id, subtask_id, str(exc))
+            task_snapshot = tasks.get(parent_task_id) or {}
+            _persist_subtask_failed(app, parent_task_id, subtask_id, str(exc), task_snapshot)
         except Exception:
             logger.exception("Unexpected dispatch failure for subtask %s", subtask_id)
             tasks.fail_subtask(parent_task_id, subtask_id, "Subtask execution failed")
+            task_snapshot = tasks.get(parent_task_id) or {}
+            _persist_subtask_failed(app, parent_task_id, subtask_id, "Subtask execution failed", task_snapshot)
         finally:
             nodes.set_task_state(node_id, "IDLE")
 
@@ -688,6 +1097,7 @@ def create_app(
         selected_nodes = scheduler.select_nodes(desired_subtasks)
         if not selected_nodes:
             tasks.fail_parent(task_id, "No ONLINE, IDLE worker node is available")
+            _persist_parent_failed(app, task_id, "No ONLINE, IDLE worker node is available")
             return
 
         submitted_node_ids: set[str] = set()
@@ -700,15 +1110,15 @@ def create_app(
             subtasks = tasks.create_subtasks(task_id, assignments)
             if subtasks is None:
                 raise RuntimeError("Task could not be split")
+            _persist_task_split_and_subtasks(app, task_id, len(subtasks), subtasks)
             for subtask, node in zip(subtasks, selected_nodes, strict=True):
                 executor.submit(dispatch_subtask, task_id, subtask, node)
                 submitted_node_ids.add(node["node_id"])
         except Exception:
             logger.exception("Unexpected split/dispatch failure for task %s", task_id)
             tasks.fail_parent(task_id, "Task could not be split or dispatched")
+            _persist_parent_failed(app, task_id, "Task could not be split or dispatched")
             for node in selected_nodes:
-                # Do not incorrectly free a node whose subtask was already
-                # submitted and may still be executing.
                 if node["node_id"] not in submitted_node_ids:
                     nodes.set_task_state(node["node_id"], "IDLE")
 
@@ -722,7 +1132,7 @@ def create_app(
         if error:
             return error
         try:
-            node, is_new = nodes.register(
+            node, is_new, was_offline = nodes.register(
                 required_text(payload, "node_id"),
                 required_text(payload, "hostname"),
                 required_text(payload, "platform"),
@@ -731,9 +1141,7 @@ def create_app(
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
 
-        # Stage 4B: persist (or refresh) the Node row.  A DB failure is
-        # non-fatal; the in-memory registry already accepted the registration.
-        _persist_node_upsert(node)
+        _persist_node_upsert(app, node, is_new=is_new, was_offline=was_offline)
 
         return jsonify(message="Node registered" if is_new else "Node registration refreshed", node=node), 201 if is_new else 200
 
@@ -756,7 +1164,7 @@ def create_app(
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
 
-        node = nodes.heartbeat(
+        node, was_offline = nodes.heartbeat(
             node_id,
             hostname,
             platform,
@@ -768,23 +1176,25 @@ def create_app(
         if node is None:
             return jsonify(error="Node is not registered", node_id=node_id), 404
 
-        # Stage 4B: persist one NodeMetric row and keep the Node row in sync.
-        # A DB failure must not kill the heartbeat response to the worker.
         hb_ts = _parse_heartbeat_timestamp(timestamp)
         _persist_heartbeat_metric(
-            node_id, hostname, platform, cpu_percent, memory_percent, available_memory, hb_ts
+            app, node_id, hostname, platform, cpu_percent, memory_percent, available_memory, hb_ts, was_offline=was_offline
         )
 
         return jsonify(message="Heartbeat accepted", node=node), 200
 
     @app.get("/api/nodes")
     def list_nodes() -> tuple[Any, int]:
+        offline_nodes = nodes.mark_timed_out_nodes_offline()
+        _persist_node_offline(app, offline_nodes)
         node_list = nodes.list_nodes()
         return jsonify(nodes=node_list, count=len(node_list)), 200
 
     @app.get("/api/nodes/<node_id>")
     def get_node(node_id: str) -> tuple[Any, int]:
         """Return node state plus the latest persisted metric from PostgreSQL."""
+        offline_nodes = nodes.mark_timed_out_nodes_offline()
+        _persist_node_offline(app, offline_nodes)
         node_list = nodes.list_nodes()
         node = next((n for n in node_list if n["node_id"] == node_id), None)
         if node is None:
@@ -825,7 +1235,6 @@ def create_app(
         node_list = nodes.list_nodes()
         node_known = any(n["node_id"] == node_id for n in node_list)
         if not node_known:
-            # Fall back to the database in case the master was restarted.
             try:
                 db_node = db.session.execute(
                     db.select(Node).where(Node.node_id == node_id)
@@ -865,6 +1274,8 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> tuple[Any, int]:
+        offline_nodes = nodes.mark_timed_out_nodes_offline()
+        _persist_node_offline(app, offline_nodes)
         total_nodes, online_nodes = nodes.counts()
         return (
             jsonify(
@@ -892,7 +1303,7 @@ def create_app(
             return jsonify(error=str(exc)), 400
 
         task = tasks.create(task_type, start, end)
-        # The initial response is always CREATED; lifecycle advances asynchronously.
+        _persist_task_created(app, task)
         executor.submit(dispatch_parent_task, task["task_id"])
         return jsonify(task_id=task["task_id"], status="CREATED"), 201
 
@@ -901,18 +1312,169 @@ def create_app(
         task_list = tasks.list()
         return jsonify(tasks=task_list, count=len(task_list)), 200
 
+    @app.get("/api/tasks/history")
+    def task_history() -> tuple[Any, int]:
+        """Query PostgreSQL for durable historical task records."""
+        raw_limit = request.args.get("limit", "50")
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                raise ValueError("limit must be positive")
+        except ValueError:
+            return jsonify(error="limit must be a positive integer"), 400
+
+        tasks_list: list[dict[str, Any]] = []
+        try:
+            rows = db.session.execute(
+                db.select(Task).order_by(Task.created_at.desc()).limit(limit)
+            ).scalars().all()
+            for row in rows:
+                subtasks_list = [
+                    {
+                        "subtask_id": s.subtask_id,
+                        "parent_task_id": s.parent_task_id,
+                        "task_type": s.task_type,
+                        "start": s.start,
+                        "end": s.end,
+                        "assigned_node": s.node_id,
+                        "status": s.status,
+                        "result": s.result,
+                        "error": s.error,
+                        "created_at": s.created_at.isoformat() if s.created_at else None,
+                        "started_at": s.started_at.isoformat() if s.started_at else None,
+                        "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    }
+                    for s in row.subtasks
+                ]
+                tasks_list.append({
+                    "task_id": row.task_id,
+                    "task_type": row.task_type,
+                    "status": row.status,
+                    "start": row.start,
+                    "end": row.end,
+                    "total_subtasks": row.total_subtasks,
+                    "completed_subtasks": row.completed_subtasks,
+                    "failed_subtasks": row.failed_subtasks,
+                    "final_result": row.final_result,
+                    "error": row.error,
+                    "subtasks": subtasks_list,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "started_at": row.started_at.isoformat() if row.started_at else None,
+                    "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                })
+        except Exception:
+            logger.exception("DB read failed for task history")
+
+        return jsonify(tasks=tasks_list, count=len(tasks_list)), 200
+
     @app.get("/api/tasks/<task_id>")
     def get_task(task_id: str) -> tuple[Any, int]:
         task = tasks.get(task_id)
-        if task is None:
+        if task is not None:
+            return jsonify(task), 200
+
+        # Fall back to DB if task is no longer in memory
+        try:
+            row = db.session.execute(
+                db.select(Task).where(Task.task_id == task_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return jsonify(error="Task not found", task_id=task_id), 404
+
+            subtasks_list = [
+                {
+                    "subtask_id": s.subtask_id,
+                    "parent_task_id": s.parent_task_id,
+                    "task_type": s.task_type,
+                    "start": s.start,
+                    "end": s.end,
+                    "assigned_node": s.node_id,
+                    "status": s.status,
+                    "result": s.result,
+                    "error": s.error,
+                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                    "started_at": s.started_at.isoformat() if s.started_at else None,
+                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                }
+                for s in row.subtasks
+            ]
+
+            return jsonify({
+                "task_id": row.task_id,
+                "task_type": row.task_type,
+                "status": row.status,
+                "start": row.start,
+                "end": row.end,
+                "total_subtasks": row.total_subtasks,
+                "completed_subtasks": row.completed_subtasks,
+                "failed_subtasks": row.failed_subtasks,
+                "result": row.final_result,
+                "final_result": row.final_result,
+                "error": row.error,
+                "subtasks": subtasks_list,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "started_at": row.started_at.isoformat() if row.started_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            }), 200
+        except Exception:
+            logger.exception("DB read failed for task detail %s", task_id)
             return jsonify(error="Task not found", task_id=task_id), 404
-        return jsonify(task), 200
+
+    # -----------------------------------------------------------------------
+    # Event endpoints
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/events")
+    def list_events() -> tuple[Any, int]:
+        """Query PostgreSQL for audit event history with optional filters."""
+        raw_limit = request.args.get("limit", "50")
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                raise ValueError("limit must be positive")
+        except ValueError:
+            return jsonify(error="limit must be a positive integer"), 400
+
+        event_type = request.args.get("event_type")
+        task_id = request.args.get("task_id")
+        node_id = request.args.get("node_id")
+
+        events_list: list[dict[str, Any]] = []
+        try:
+            stmt = db.select(Event)
+            if event_type:
+                stmt = stmt.where(Event.event_type == event_type)
+            if task_id:
+                stmt = stmt.where(Event.task_id == task_id)
+            if node_id:
+                stmt = stmt.where(Event.node_id == node_id)
+
+            stmt = stmt.order_by(Event.timestamp.desc()).limit(limit)
+            rows = db.session.execute(stmt).scalars().all()
+            events_list = [
+                {
+                    "id": row.id,
+                    "timestamp": row.timestamp.isoformat(),
+                    "event_type": row.event_type,
+                    "task_id": row.task_id,
+                    "subtask_id": row.subtask_id,
+                    "node_id": row.node_id,
+                    "message": row.message,
+                    "severity": row.severity,
+                }
+                for row in rows
+            ]
+        except Exception:
+            logger.exception("DB read failed for events")
+
+        return jsonify(events=events_list, count=len(events_list)), 200
 
     if start_monitor:
         def offline_monitor() -> None:
             while True:
                 time.sleep(check_interval)
-                nodes.mark_timed_out_nodes_offline()
+                offline_nodes = nodes.mark_timed_out_nodes_offline()
+                _persist_node_offline(app, offline_nodes)
 
         monitor = threading.Thread(target=offline_monitor, name="offline-monitor", daemon=True)
         monitor.start()

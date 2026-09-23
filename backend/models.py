@@ -73,3 +73,87 @@ class NodeMetric(db.Model):
     heartbeat_latency: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     node: Mapped[Node] = relationship("Node", back_populates="metrics")
+
+
+class Task(db.Model):
+    """Persistent execution history for workload parent tasks, introduced in Stage 4C."""
+
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_subtasks: Mapped[int] = mapped_column(default=0, nullable=False)
+    completed_subtasks: Mapped[int] = mapped_column(default=0, nullable=False)
+    failed_subtasks: Mapped[int] = mapped_column(default=0, nullable=False)
+    final_result: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=False, default=utc_now
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    subtasks: Mapped[list[Subtask]] = relationship(
+        "Subtask", back_populates="task", cascade="all, delete-orphan", passive_deletes=True
+    )
+    events: Mapped[list[Event]] = relationship("Event", back_populates="task")
+
+
+class Subtask(db.Model):
+    """Persistent execution history for split subtasks, introduced in Stage 4C."""
+
+    __tablename__ = "subtasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subtask_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    parent_task_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("tasks.task_id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    node_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("nodes.node_id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    result: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    task: Mapped[Task] = relationship("Task", back_populates="subtasks")
+    node: Mapped[Node | None] = relationship("Node")
+
+
+class Event(db.Model):
+    """Chronological event audit log, introduced in Stage 4C."""
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=False, default=utc_now
+    )
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("tasks.task_id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    subtask_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("subtasks.subtask_id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    node_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("nodes.node_id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    message: Mapped[str] = mapped_column(String(1024), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="INFO")
+
+    task: Mapped[Task | None] = relationship("Task", back_populates="events")
+    subtask: Mapped[Subtask | None] = relationship("Subtask")
+    node: Mapped[Node | None] = relationship("Node")

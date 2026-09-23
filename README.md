@@ -1,8 +1,8 @@
 # Intelligent Distributive Computing Platform (IDCP)
 
-IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stages 1–3 plus **Stage 4A: PostgreSQL and SQLAlchemy foundation** and **Stage 4B: Persistent node metrics and heartbeat history** on a single laptop.
+IDCP is a B.Tech project exploring a predictive, risk-aware, self-healing distributed computing platform. This repository implements Stages 1–3 plus **Stage 4A: PostgreSQL foundation**, **Stage 4B: Persistent node metrics**, and **Stage 4C: Task, subtask, and event persistence** on a single laptop.
 
-It deliberately does not yet include ML, blockchain, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. Stage 4A created the initial persistent schema; Stage 4B now persists every real worker heartbeat into PostgreSQL while keeping the proven Stage 1–3 in-memory registries as the scheduling source of truth.
+It deliberately does not yet include ML, blockchain, React, workload migration, predictive/risk-aware scheduling, checkpointing, retry, or advanced scheduling. Stage 4C persists task execution history, split subtask records, and system audit events into PostgreSQL while keeping the proven Stage 1–3 in-memory registries as the scheduling source of truth.
 
 ## What Stages 1-3 implement
 
@@ -121,8 +121,10 @@ The available APIs are:
 | `GET` | `/api/nodes/<node_id>/metrics` | Heartbeat history for one node |
 | `GET` | `/api/health` | Check master health and node counts |
 | `POST` | `/api/tasks` | Create and asynchronously dispatch a workload |
-| `GET` | `/api/tasks` | List all known workloads |
-| `GET` | `/api/tasks/<task_id>` | Retrieve one workload and its result |
+| `GET` | `/api/tasks` | List all active in-memory workloads |
+| `GET` | `/api/tasks/history` | Query durable historical task records |
+| `GET` | `/api/tasks/<task_id>` | Retrieve one workload detail and subtasks |
+| `GET` | `/api/events` | Query chronological audit events with filters |lt |
 
 ## Stage 2: single-worker workload execution
 
@@ -298,6 +300,25 @@ $id   = docker compose ps -q postgres
 docker exec -it $id psql -U $user -d $db -c "SELECT node_id, COUNT(*) FROM node_metrics GROUP BY node_id;"
 ```
 
+## Stage 4C: Task, subtask, and event persistence
+
+Stage 4C persists workload parent task records (`Task` model), split subtask execution records (`Subtask` model), and a chronological audit log (`Event` model) into PostgreSQL.
+
+The in-memory `TaskRegistry` and `RoundRobinScheduler` remain the authoritative execution engine; PostgreSQL is the durable historical record.
+
+### Event Types
+
+Supported event types include:
+- `NODE_REGISTERED`, `NODE_OFFLINE`, `NODE_ONLINE`
+- `TASK_CREATED`, `TASK_ASSIGNED`, `TASK_STARTED`, `TASK_COMPLETED`, `TASK_FAILED`
+- `SUBTASK_CREATED`, `SUBTASK_ASSIGNED`, `SUBTASK_STARTED`, `SUBTASK_COMPLETED`, `SUBTASK_FAILED`
+
+### Stage 4C API endpoints
+
+- **`GET /api/tasks/history?limit=50`**: Returns durable historical task records from PostgreSQL ordered newest-first.
+- **`GET /api/events?limit=50&event_type=...&task_id=...&node_id=...`**: Queries chronological audit log with optional filters.
+- **`GET /api/tasks/<task_id>`**: Returns active in-memory task detail, falling back to PostgreSQL if the master was restarted.
+
 ## Test node failure and recovery
 
 1. Stop one actual worker container:
@@ -312,7 +333,7 @@ docker exec -it $id psql -U $user -d $db -c "SELECT node_id, COUNT(*) FROM node_
    Invoke-RestMethod http://localhost:5000/api/nodes | ConvertTo-Json -Depth 5
    ```
 
-   `node-01` will be `OFFLINE`, while `node-02` and `node-03` stay `ONLINE`. The master log records the transition.
+   `node-01` will be `OFFLINE`, while `node-02` and `node-03` stay `ONLINE`. A `NODE_OFFLINE` event is logged in PostgreSQL.
 
 3. Restart it:
 
@@ -320,9 +341,7 @@ docker exec -it $id psql -U $user -d $db -c "SELECT node_id, COUNT(*) FROM node_
    docker compose start node-01
    ```
 
-   Within one heartbeat interval (five seconds), the agent re-registers and reports as `ONLINE` again.
-
-To confirm Stage 3 avoids an offline worker, stop `node-01`, wait for its `OFFLINE` status, then submit a `sum_range` task. The parent will split only across `ONLINE`, `IDLE` remaining nodes. Stage 3 does not migrate or retry a subtask already assigned to a failed worker.
+   Within one heartbeat interval (five seconds), the agent re-registers and reports as `ONLINE` again. A `NODE_ONLINE` event is logged in PostgreSQL.
 
 ## Automated tests
 
@@ -331,7 +350,8 @@ Lightweight `unittest` coverage is in `tests/`. The suite covers:
 - `test_database.py` — Stage 4A schema, Node model, and connection retry logic.
 - `test_stage2.py` — Stage 2 single-node execution regression.
 - `test_stage3.py` — Stage 3 range splitting, aggregation, failure, and scheduler tests.
-- `test_stage4b.py` — Stage 4B: `NodeMetric` model, heartbeat persistence, multiple records, real metric values, metrics API (basic / limit / ordering), node detail API (basic / `latest_metric`), no duplicate Node rows, offline detection without fake metrics, node recovery, and Stage 2/3 regression.
+- `test_stage4b.py` — Stage 4B: `NodeMetric` model, heartbeat persistence, metrics API, node detail API, and regression.
+- `test_stage4c.py` — Stage 4C: `Task`, `Subtask`, and `Event` models, task creation persistence, subtask splitting/assignment, subtask completion/failure, parent aggregation/failure, event history API with filtering, task history API, no duplicate node lifecycle events, and Stage 2/3/4A/4B regression.
 
 All tests use an in-memory SQLite database so no running PostgreSQL instance is needed.
 
